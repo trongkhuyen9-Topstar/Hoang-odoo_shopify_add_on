@@ -1,6 +1,8 @@
 # Odoo Shopify Addon
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support%20Me-orange)](https://www.buymeacoffee.com/gerardosociasjr)
+<a href="https://buymeacoffee.com/gerardosociasjr" target="_blank">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" style="height: 60px !important; width: 217px !important;">
+</a>
 
 ## Overview
 
