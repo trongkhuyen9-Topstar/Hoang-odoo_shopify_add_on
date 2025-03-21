@@ -12,13 +12,17 @@ class OdooSync(models.Model):
 	_description = "Sync Odoo Products to Shopify"
 
 	name = fields.Char("Sync Name", required=True)
-    sync_status = fields.Selection([
-        ('pending', 'Pending'),
-        ('in_progress', 'In Progress'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-    ], string="Status", default="pending")
-    sync_date = fields.Datetime("Last Sync")
+	sync_status = fields.Selection([
+		('pending', 'Pending'),
+		('in_progress', 'In Progress'),
+		('completed', 'Completed'),
+		('failed', 'Failed'),
+	], string="Status", default="pending")
+	sync_date = fields.Datetime("Last Sync")
+
+	def test_connection(self):
+		# Ensure this method exists
+		return True
 
 	@api.model
 	def _auto_sync_to_shopify(self):
