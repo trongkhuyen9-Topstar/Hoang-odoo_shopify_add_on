@@ -7,7 +7,7 @@ from odoo import models, fields, api
 
 _logger = logging.getLogger(__name__)
 
-class ShopifyExport(models.Model):
+class OdooSync(models.Model):
 	_name = "odoo.sync"
 	_description = "Sync Odoo Products to Shopify"
 
