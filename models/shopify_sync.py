@@ -12,6 +12,16 @@ class ShopifySync(models.Model):
     _name = "shopify.sync"
     _description = "Sync Shopify Products to Odoo"
 
+    name = fields.Char("Sync Name", required=True)
+    shopify_id = fields.Char("Shopify ID")
+    sync_status = fields.Selection([
+        ('pending', 'Pending'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ], string="Status", default="pending")
+    sync_date = fields.Datetime("Last Sync")
+
     @api.model
     def _auto_sync_products(self):
         """Auto-sync Shopify products (for cron jobs)"""

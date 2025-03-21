@@ -1,0 +1,9 @@
+<odoo>
+    <menuitem id="sync_main_menu" name="Sync" sequence="10"/>
+
+    <menuitem id="odoo_sync_menu" parent="sync_main_menu"
+        name="Odoo Sync" action="action_odoo_sync"/>
+
+    <menuitem id="shopify_sync_menu" parent="sync_main_menu"
+        name="Shopify Sync" action="action_shopify_sync"/>
+</odoo>

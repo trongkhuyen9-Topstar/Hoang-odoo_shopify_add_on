@@ -11,24 +11,20 @@ class OdooSync(models.Model):
 	_name = "odoo.sync"
 	_description = "Sync Odoo Products to Shopify"
 
+	name = fields.Char("Sync Name", required=True)
+    sync_status = fields.Selection([
+        ('pending', 'Pending'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    ], string="Status", default="pending")
+    sync_date = fields.Datetime("Last Sync")
+
 	@api.model
 	def _auto_sync_to_shopify(self):
 		"""Auto-sync Odoo products to Shopify (for cron jobs)"""
 		_logger.info("Running auto Odoo to Shopify sync...")
 		return self.sync_products_to_shopify()
-		
-	@api.model
-    def test_connection(self):
-        # Add your Shopify connection test logic here
-        return {
-            'type': 'ir.actions.client',
-            'tag': 'display_notification',
-            'params': {
-                'title': 'Success',
-                'message': 'Shopify connection successful!',
-                'sticky': False,
-            }
-        }
 
 	@api.model
 	def sync_products_to_shopify(self, product_ids=None):
