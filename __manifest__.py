@@ -9,5 +9,9 @@
   'category': 'Inventory',
   'license': 'LGPL-3',
   'maintainer': 'Franco',
-  'description': 'Automatically sync products, stock levels, and updates between Shopify and Odoo.'
+  'description': 'Automatically sync products, stock levels, and updates between Shopify and Odoo.',
+
+  "data": [
+    "views/odoo_shopify_views.xml"
+  ]
 }
