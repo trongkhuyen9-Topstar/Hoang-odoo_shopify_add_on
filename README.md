@@ -14,7 +14,7 @@ This Odoo addon integrates Shopify with Odoo, enabling synchronization of produc
 
 ## Python Version
 
-This addon requires **Python 3.8+**.
+This addon requires **Python 3.11+**.
 
 ## Installation
 
