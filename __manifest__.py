@@ -11,7 +11,7 @@
   'maintainer': 'Franco',
   'description': 'Automatically sync products, stock levels, and updates between Shopify and Odoo.',
 
-  'data': [
-    'views/odoo_shopify_views.xml',
-  ]
+  # 'data': [
+  #   'views/odoo_shopify_views.xml',
+  # ]
 }
