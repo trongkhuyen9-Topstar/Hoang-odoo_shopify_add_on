@@ -1,0 +1,33 @@
+<!-- File: shopify_export_views.xml -->
+<odoo>
+    <!-- Add button to product form view -->
+    <record id="product_normal_form_view_shopify_inherit" model="ir.ui.view">
+        <field name="name">product.product.form.shopify.inherit</field>
+        <field name="model">product.product</field>
+        <field name="inherit_id" ref="product.product_normal_form_view"/>
+        <field name="arch" type="xml">
+            <div name="button_box" position="inside">
+                <button 
+                    name="sync_to_shopify" 
+                    type="object" 
+                    class="oe_stat_button" 
+                    icon="fa-shopping-cart"
+                    string="Sync to Shopify"
+                    attrs="{'invisible': [('active', '=', False)]}"
+                />
+            </div>
+        </field>
+    </record>
+
+    <!-- Scheduled Action for automatic sync -->
+    <record id="ir_cron_sync_to_shopify" model="ir.cron">
+        <field name="name">Sync Odoo Products to Shopify</field>
+        <field name="model_id" ref="model_shopify_export"/>
+        <field name="state">code</field>
+        <field name="code">model._auto_sync_to_shopify()</field>
+        <field name="interval_number">10</field>
+        <field name="interval_type">minutes</field>
+        <field name="numbercall">-1</field>
+        <field name="doall" eval="False"/>
+    </record>
+</odoo>
