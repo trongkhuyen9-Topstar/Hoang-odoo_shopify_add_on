@@ -1,12 +1,18 @@
 # Odoo Shopify Addon
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support%20Me-orange)](https://www.buymeacoffee.com/gerardosociasjr)
+
 ## Overview
 
-This Odoo addon integrates Shopify with Odoo, enabling synchronization of products, orders, customers, and other related data.
+This Odoo addon integrates Shopify with Odoo, enabling synchronization of products and other related data.
 
 ## Features
 
 - Sync products from Shopify to Odoo and vice versa
+
+## Python Version
+
+This addon requires **Python 3.8+**.
 
 ## Installation
 
