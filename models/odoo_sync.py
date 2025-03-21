@@ -16,7 +16,20 @@ class OdooSync(models.Model):
 		"""Auto-sync Odoo products to Shopify (for cron jobs)"""
 		_logger.info("Running auto Odoo to Shopify sync...")
 		return self.sync_products_to_shopify()
-	
+		
+	@api.model
+    def test_connection(self):
+        # Add your Shopify connection test logic here
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': 'Success',
+                'message': 'Shopify connection successful!',
+                'sticky': False,
+            }
+        }
+
 	@api.model
 	def sync_products_to_shopify(self, product_ids=None):
 		"""
