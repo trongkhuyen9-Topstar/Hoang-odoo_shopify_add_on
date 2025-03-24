@@ -28,6 +28,7 @@ class ShopifySync(models.Model):
         _logger.info("Running auto Shopify sync...")
         return self.sync_products_to_odoo()
 
+    @api.model
     def fetch_shopify_products(self, last_sync_time=None, batch_size=50):
         """
         Fetch Shopify products with pagination, sorted by `updated_at` ascending
@@ -175,8 +176,8 @@ class ShopifySync(models.Model):
             if not sku:
                 _logger.info(f"Product '{product['title']}' (ID: {shopify_product_id}) has no SKU.")
                 # _logger.warning(f"Skipping product '{product['title']}' (ID: {shopify_product_id}) due to missing SKU.")
-                skipped += 1
-                continue
+                # skipped += 1
+                # continue
 
             # First try to find by Shopify product ID (more reliable than SKU)
             existing_product = ProductModel.search([('shopify_product_id', '=', shopify_product_id)], limit=1)
