@@ -162,10 +162,10 @@ class ShopifySync(models.Model):
 
         for product in shopify_products:
             # Basic validation
-            if not product.get("variants") or not product["variants"]:
-                _logger.warning(f"Skipping product ID {product.get('id')} - no variants found")
-                skipped += 1
-                continue
+            # if not product.get("variants") or not product["variants"]:
+            #     _logger.warning(f"Skipping product ID {product.get('id')} - no variants found")
+            #     skipped += 1
+            #     continue
                 
             shopify_product_id = str(product["id"])  # Convert to string for consistent comparison
             sku = product["variants"][0].get("sku", "")
@@ -173,7 +173,8 @@ class ShopifySync(models.Model):
             price = float(product["variants"][0].get("price", 0.0))
 
             if not sku:
-                _logger.warning(f"Skipping product '{product['title']}' (ID: {shopify_product_id}) due to missing SKU.")
+                _logger.info(f"Product '{product['title']}' (ID: {shopify_product_id}) has no SKU.")
+                # _logger.warning(f"Skipping product '{product['title']}' (ID: {shopify_product_id}) due to missing SKU.")
                 skipped += 1
                 continue
 
@@ -186,7 +187,7 @@ class ShopifySync(models.Model):
 
             product_data = {
                 'name': product['title'],
-                'default_code': sku,
+                'default_code': sku if sku else None,
                 'list_price': price,
                 'description_sale': product.get("body_html", ""),
                 'shopify_product_id': shopify_product_id,
