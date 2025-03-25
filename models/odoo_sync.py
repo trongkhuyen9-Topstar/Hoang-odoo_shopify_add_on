@@ -149,6 +149,12 @@ class OdooSync(models.Model):
 		Returns:
 			dict: Formatted product data for Shopify
 		"""
+		# Get product status from system parameters
+		shopify_product_status = self.env['ir.config_parameter'].sudo().get_param('shopify.product_status', 'draft')
+		
+		# Determine if the product should be published
+		is_published = shopify_product_status == 'active'
+
 		# Convert image to base64 if present
 		image_data = None
 		if product.image_1920:
@@ -169,7 +175,8 @@ class OdooSync(models.Model):
 			"body_html": product.description_sale or "",
 			"vendor": product.company_id.name if product.company_id else "",
 			"product_type": product.categ_id.name if product.categ_id else "",
-			"published": True,
+			"published": is_published,
+			"status": shopify_product_status,
 			"variants": [variant]
 		}
 		
@@ -200,28 +207,28 @@ class OdooSync(models.Model):
 		return int(sum(quants.mapped('quantity')))
 
 class ProductProductShopify(models.Model):
-    _inherit = "product.product"
+	_inherit = "product.product"
 
-    shopify_product_id = fields.Char("Shopify Product ID", index=True, help="ID of the product in Shopify")
-    
-    def sync_to_shopify(self):
-        """Sync this product to Shopify (can be called from UI button)"""
-        self.ensure_one()
-        return self.env['odoo.sync'].sync_products_to_shopify(product_ids=[self.id])
-    
-    @api.model_create_multi
-    def create(self, vals_list):
-        """Override create to sync new products to Shopify"""
-        new_products = super(ProductProductShopify, self).create(vals_list)
-        # Queue these products for Shopify sync
-        self.env['odoo.sync'].with_delay(priority=20).sync_products_to_shopify(product_ids=new_products.ids)
-        return new_products
-    
-    def write(self, vals):
-        """Override write to sync updated products to Shopify"""
-        result = super(ProductProductShopify, self).write(vals)
-        # Only sync if relevant fields changed
-        relevant_fields = ['name', 'default_code', 'list_price', 'description_sale', 'image_1920', 'active']
-        if any(field in vals for field in relevant_fields):
-            self.env['odoo.sync'].with_delay(priority=20).sync_products_to_shopify(product_ids=self.ids)
-        return result
+	shopify_product_id = fields.Char("Shopify Product ID", index=True, help="ID of the product in Shopify")
+	
+	def sync_to_shopify(self):
+		"""Sync this product to Shopify (can be called from UI button)"""
+		self.ensure_one()
+		return self.env['odoo.sync'].sync_products_to_shopify(product_ids=[self.id])
+	
+	@api.model_create_multi
+	def create(self, vals_list):
+		"""Override create to sync new products to Shopify"""
+		new_products = super(ProductProductShopify, self).create(vals_list)
+		# Queue these products for Shopify sync
+		self.env['odoo.sync'].with_delay(priority=20).sync_products_to_shopify(product_ids=new_products.ids)
+		return new_products
+	
+	def write(self, vals):
+		"""Override write to sync updated products to Shopify"""
+		result = super(ProductProductShopify, self).write(vals)
+		# Only sync if relevant fields changed
+		relevant_fields = ['name', 'default_code', 'list_price', 'description_sale', 'image_1920', 'active']
+		if any(field in vals for field in relevant_fields):
+			self.env['odoo.sync'].with_delay(priority=20).sync_products_to_shopify(product_ids=self.ids)
+		return result
