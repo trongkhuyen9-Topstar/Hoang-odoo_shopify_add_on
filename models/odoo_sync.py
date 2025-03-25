@@ -216,19 +216,20 @@ class ProductProductShopify(models.Model):
 		self.ensure_one()
 		return self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=[self.id])
 	
-	@api.model_create_multi
-	def create(self, vals_list):
-		"""Override create to sync new products to Shopify"""
-		new_products = super(ProductProductShopify, self).create(vals_list)
-		# Queue these products for Shopify sync
-		self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=new_products.ids)
-		return new_products
+	# Remove or comment out these methods
+	# @api.model_create_multi
+	# def create(self, vals_list):
+	# 	"""Override create to sync new products to Shopify"""
+	# 	new_products = super(ProductProductShopify, self).create(vals_list)
+	# 	# Queue these products for Shopify sync
+	# 	self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=new_products.ids)
+	# 	return new_products
 	
-	def write(self, vals):
-		"""Override write to sync updated products to Shopify"""
-		result = super(ProductProductShopify, self).write(vals)
-		# Only sync if relevant fields changed
-		relevant_fields = ['name', 'default_code', 'list_price', 'description_sale', 'image_1920', 'active']
-		if any(field in vals for field in relevant_fields):
-			self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=self.ids)
-		return result
+	# def write(self, vals):
+	# 	"""Override write to sync updated products to Shopify"""
+	# 	result = super(ProductProductShopify, self).write(vals)
+	# 	# Only sync if relevant fields changed
+	# 	relevant_fields = ['name', 'default_code', 'list_price', 'description_sale', 'image_1920', 'active']
+	# 	if any(field in vals for field in relevant_fields):
+	# 		self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=self.ids)
+	# 	return result
