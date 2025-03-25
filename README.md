@@ -43,6 +43,8 @@ Ensure that the required environment variables are set in Odoo using `ir.config_
 2. Add the following parameters:
    - `shopify.access_token`: Your Shopify API access token.
    - `shopify.store_url`: Your Shopify store URL.
+   - `shopify.last_export_time`: Set to 2000-01-01 00:00:00 on first use (YYYY-MM-DD HH:MM:SS format). 
+   - `shopify.last_sync_time`: Set to 2000-01-01T00:00:00.000000
 3. Save the changes and restart Odoo if necessary.
 
 ## Setting Up Cron Jobs
