@@ -12,6 +12,7 @@
   'description': 'Automatically sync products, stock levels, and updates between Shopify and Odoo.',
 
   "data": [
-    "views/odoo_shopify_views.xml"
+    "views/odoo_sync_views.xml",
+    "views/shopify_sync_views.xml"
   ]
 }
