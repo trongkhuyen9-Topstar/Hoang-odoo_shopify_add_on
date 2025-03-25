@@ -70,7 +70,7 @@ class OdooSync(models.Model):
 				products_to_sync = ProductModel.search([
 					('write_date', '>', last_sync_to_shopify),
 					('active', '=', True)
-				])
+				], limit=20)
 				_logger.info(f"Found {len(products_to_sync)} products modified since {last_sync_to_shopify}")
 			else:
 				# First-time sync, start with a reasonable batch
@@ -85,7 +85,8 @@ class OdooSync(models.Model):
 				product_data = self._prepare_shopify_product_data(product)
 				
 				# Check if product already exists in Shopify
-				if product.shopify_product_id:
+				_logger.info(f"product.shopify_product_id: {product.shopify_product_id}")
+				if product.shopify_product_id and isinstance(product.shopify_product_id, str) and product.shopify_product_id.isdigit():
 					# Update existing product
 					product_url = f"https://{shopify_store_url}/admin/api/2023-01/products/{product.shopify_product_id}.json"
 					response = requests.put(
@@ -200,6 +201,8 @@ class OdooSync(models.Model):
 
 class ProductProductShopify(models.Model):
     _inherit = "product.product"
+
+    shopify_product_id = fields.Char("Shopify Product ID", index=True, help="ID of the product in Shopify")
     
     def sync_to_shopify(self):
         """Sync this product to Shopify (can be called from UI button)"""
