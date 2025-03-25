@@ -214,14 +214,14 @@ class ProductProductShopify(models.Model):
 	def sync_to_shopify(self):
 		"""Sync this product to Shopify (can be called from UI button)"""
 		self.ensure_one()
-		return self.env['odoo.sync'].sync_products_to_shopify(product_ids=[self.id])
+		return self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=[self.id])
 	
 	@api.model_create_multi
 	def create(self, vals_list):
 		"""Override create to sync new products to Shopify"""
 		new_products = super(ProductProductShopify, self).create(vals_list)
 		# Queue these products for Shopify sync
-		self.env['odoo.sync'].with_delay(priority=20).sync_products_to_shopify(product_ids=new_products.ids)
+		self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=new_products.ids)
 		return new_products
 	
 	def write(self, vals):
@@ -230,5 +230,5 @@ class ProductProductShopify(models.Model):
 		# Only sync if relevant fields changed
 		relevant_fields = ['name', 'default_code', 'list_price', 'description_sale', 'image_1920', 'active']
 		if any(field in vals for field in relevant_fields):
-			self.env['odoo.sync'].with_delay(priority=20).sync_products_to_shopify(product_ids=self.ids)
+			self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=self.ids)
 		return result
