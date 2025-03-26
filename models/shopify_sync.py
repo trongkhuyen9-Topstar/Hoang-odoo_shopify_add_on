@@ -39,7 +39,7 @@ class ShopifySync(models.Model):
         """
         shopify_access_token = self.env['ir.config_parameter'].sudo().get_param('shopify.access_token')
         shopify_store_url = self.env['ir.config_parameter'].sudo().get_param('shopify.store_url')
-        last_page_info = self.env['ir.config_parameter'].sudo().get_param('shopify.last_page_info', False)
+        # last_page_info = self.env['ir.config_parameter'].sudo().get_param('shopify.last_page_info', False)
 
         if not shopify_access_token or not shopify_store_url:
             _logger.error("Missing Shopify credentials. Ensure they are set in system parameters.")
@@ -48,26 +48,17 @@ class ShopifySync(models.Model):
         base_url = f"https://{shopify_store_url}/admin/api/2023-01/products.json"
         headers = {"X-Shopify-Access-Token": shopify_access_token}
 
-        # If we have a page_info token from a previous sync, use that to continue pagination
-        if last_page_info:
-            params = {
-                "limit": batch_size,
-                "page_info": last_page_info
-            }
-            _logger.info(f"Continuing pagination from previous sync with page_info token")
-        else:
-            # Start a new sync sequence
-            params = {
-                "limit": batch_size,
-                "order": "updated_at asc"  # Get oldest updates first to ensure we don't miss anything
-            }
-            
-            if last_sync_time:
-                # Format timestamp properly for Shopify API
-                _logger.info(f"Filtering products updated since: {last_sync_time}")
-                params["updated_at_min"] = last_sync_time
+        # Start a new sync sequence
+        params = {
+            "limit": batch_size,
+            "order": "updated_at asc"  # Get oldest updates first to ensure we don't miss anything
+        }
         
-        next_page_info = None
+        if last_sync_time:
+            # Format timestamp properly for Shopify API
+            _logger.info(f"Filtering products updated since: {last_sync_time}")
+            params["updated_at_min"] = last_sync_time
+        
         all_products = []
         
         try:
@@ -112,15 +103,6 @@ class ShopifySync(models.Model):
                                 _logger.info(f"Extracted page_info token for next batch")
                                 break
             
-            # Save the page_info for the next cron run
-            if next_page_info:
-                self.env['ir.config_parameter'].sudo().set_param('shopify.last_page_info', next_page_info)
-                _logger.info(f"Saved page_info token for next sync batch")
-            else:
-                # If there's no next page, we've reached the end - clear the token
-                self.env['ir.config_parameter'].sudo().set_param('shopify.last_page_info', False)
-                _logger.info("No more pages available, cleared page_info token")
-                
         except Exception as e:
             _logger.exception(f"Error fetching products from Shopify: {str(e)}")
 
@@ -146,16 +128,8 @@ class ShopifySync(models.Model):
         # Fetch one batch of products
         shopify_products = self.fetch_shopify_products(last_sync_time, batch_size)
 
-        if not shopify_products:
-            # Check if we've reached the end of pagination
-            if not self.env['ir.config_parameter'].sudo().get_param('shopify.last_page_info'):
-                _logger.info("Completed all pagination or no products to sync.")
-                # Reset timestamp for next full sync
-                self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', current_sync_time)
-            else:
-                _logger.warning("No products fetched but pagination token exists. Will continue in next cron job.")
-            
-            return {"status": "success", "message": "No products fetched in this batch.", "updated": 0, "created": 0}
+        if len(shopify_products) > 1:
+            self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', current_sync_time)
 
         ProductModel = self.env['product.product']
         InventoryModel = self.env['stock.quant']
@@ -250,10 +224,7 @@ class ShopifySync(models.Model):
             except Exception as e:
                 _logger.exception(f"Error updating inventory for product {product['title']}: {str(e)}")
 
-        # Only update last_sync_time when we've processed the last page
-        if not self.env['ir.config_parameter'].sudo().get_param('shopify.last_page_info'):
-            _logger.info(f"All pagination complete, updating last_sync_time to {current_sync_time}")
-            self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', current_sync_time)
+        self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', current_sync_time)
 
         _logger.info(f"Batch sync completed: {created} created, {updated} updated, {skipped} skipped.")
         return {
