@@ -8,6 +8,23 @@ from odoo import models, fields, api
 
 _logger = logging.getLogger(__name__)
 
+# --- Weight Conversion Helper ---
+def _convert_weight_to_kg(value, unit):
+    """Converts weight value from Shopify unit to KG."""
+    unit = unit.lower()
+    if unit == 'g':
+        return value / 1000.0
+    elif unit == 'oz':
+        return value * 0.0283495
+    elif unit == 'lb':
+        return value * 0.453592
+    elif unit == 'kg':
+        return value
+    else:
+        _logger.warning(f"Unsupported weight unit '{unit}'. Assuming KG.")
+        return value
+# --- End Helper ---
+
 class ShopifySync(models.Model):
     _name = "shopify.sync"
     _description = "Sync Shopify Products to Odoo"
@@ -21,6 +38,223 @@ class ShopifySync(models.Model):
         ('failed', 'Failed'),
     ], string="Status", default="pending")
     sync_date = fields.Datetime("Last Sync")
+
+    @api.model
+    def _get_odoo_shopify_location_mapping(self):
+        """
+        Fetches Shopify locations and maps them to Odoo stock.location records.
+        Creates Odoo locations if they don't exist based on shopify_location_id.
+        Creates Odoo Warehouses and their locations if they don't exist based on shopify_location_id.
+        Maps Shopify Location ID -> Odoo Warehouse's primary Stock Location ID.
+        Caches the mapping in the context for the duration of the sync.
+
+        Returns:
+            dict: Mapping {shopify_location_id (str): odoo_stock_location_id (int)}
+        """
+        cache_key = '_shopify_warehouse_stock_loc_mapping_cache' # Renamed cache key
+        if cache_key in self.env.context:
+            _logger.info("Using cached Shopify location -> Odoo WH Stock Loc mapping.")
+            return self.env.context[cache_key]
+
+        _logger.info("Fetching Shopify locations and building Warehouse/Stock Loc mapping...")
+        shopify_access_token = self.env['ir.config_parameter'].sudo().get_param('shopify.access_token')
+        shopify_store_url = self.env['ir.config_parameter'].sudo().get_param('shopify.store_url')
+        WarehouseModel = self.env['stock.warehouse']
+        location_mapping = {} # Maps Shopify Loc ID -> Odoo WH Stock Loc ID
+
+        if not shopify_access_token or not shopify_store_url:
+            _logger.error("Missing Shopify credentials for location fetching.")
+            return {}
+
+        location_url = f"https://{shopify_store_url}/admin/api/2023-01/locations.json"
+        headers = {"X-Shopify-Access-Token": shopify_access_token}
+
+        try:
+            response = requests.get(location_url, headers=headers, timeout=15)
+            response.raise_for_status()
+
+            shopify_locations = response.json().get("locations", [])
+            _logger.info(f"Fetched {len(shopify_locations)} locations from Shopify.")
+
+            for shopify_loc in shopify_locations:
+                shopify_loc_id_str = str(shopify_loc['id'])
+                shopify_loc_name = shopify_loc['name']
+
+                # Search for existing Odoo Warehouse by Shopify ID
+                odoo_warehouse = WarehouseModel.search([('shopify_location_id', '=', shopify_loc_id_str)], limit=1)
+
+                if not odoo_warehouse:
+                    # If not found by ID, try searching by name (less reliable)
+                    odoo_warehouse = WarehouseModel.search([
+                        ('name', '=', shopify_loc_name),
+                        ('shopify_location_id', '=', False) # Only match if not already linked
+                    ], limit=1)
+
+                    if odoo_warehouse:
+                         # Found by name, link it by setting the Shopify ID
+                         try:
+                             odoo_warehouse.sudo().write({'shopify_location_id': shopify_loc_id_str})
+                             _logger.info(f"Linked existing Odoo Warehouse '{shopify_loc_name}' (ID: {odoo_warehouse.id}) to Shopify Location ID {shopify_loc_id_str}.")
+                         except Exception as link_e:
+                             _logger.error(f"Failed to link Odoo Warehouse ID {odoo_warehouse.id} to Shopify ID {shopify_loc_id_str}: {link_e}")
+                             odoo_warehouse = False # Ensure we don't use this if linking failed
+                    else:
+                         # Create a new Odoo Warehouse
+                         # Generate a short code (e.g., first 5 chars of name, uppercase)
+                         short_code = ''.join(filter(str.isalnum, shopify_loc_name))[:5].upper()
+                         if not short_code: # Handle empty or non-alphanumeric names
+                             short_code = f"SH{shopify_loc_id_str[-3:]}" # Fallback code
+
+                         # Check if code already exists
+                         code_count = WarehouseModel.search_count([('code', '=', short_code)])
+                         if code_count > 0:
+                             short_code = f"{short_code[:3]}{shopify_loc_id_str[-2:]}" # Make it more unique
+                             _logger.warning(f"Generated warehouse code '{short_code}' already exists. Using fallback: {short_code}")
+
+                         try:
+                             create_vals = {
+                                 'name': shopify_loc_name,
+                                 'code': short_code,
+                                 'shopify_location_id': shopify_loc_id_str,
+                                 'company_id': self.env.company.id,
+                             }
+                             odoo_warehouse = WarehouseModel.sudo().create(create_vals)
+                             _logger.info(f"Created new Odoo Warehouse '{odoo_warehouse.name}' (ID: {odoo_warehouse.id}, Code: {odoo_warehouse.code}) for Shopify Location ID {shopify_loc_id_str}.")
+                         except Exception as create_e:
+                             _logger.error(f"Failed to create Odoo Warehouse for Shopify Location ID {shopify_loc_id_str} (Name: {shopify_loc_name}): {create_e}")
+                             continue # Skip this location if creation fails
+
+                # Map Shopify Loc ID to the Odoo Warehouse's main Stock Location ID
+                if odoo_warehouse and odoo_warehouse.lot_stock_id:
+                    location_mapping[shopify_loc_id_str] = odoo_warehouse.lot_stock_id.id
+                elif odoo_warehouse:
+                     _logger.warning(f"Warehouse {odoo_warehouse.name} (ID: {odoo_warehouse.id}) found or created, but it has no main stock location (lot_stock_id). Cannot map.")
+                else:
+                     _logger.warning(f"Could not find or create a usable Odoo Warehouse for Shopify Loc ID {shopify_loc_id_str}. Cannot map.")
+
+
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Error fetching Shopify locations: {e}")
+        except Exception as e:
+             _logger.exception(f"Unexpected error processing Shopify locations: {e}")
+
+
+        # Cache the result in the context
+        self.env.context = dict(self.env.context, **{cache_key: location_mapping})
+        _logger.info(f"Built and cached Shopify Loc ID -> Odoo WH Stock Loc ID mapping: {location_mapping}") # Keep this final summary log
+        return location_mapping
+
+
+    @api.model
+    def _fetch_shopify_inventory_levels(self, inventory_item_id):
+        """
+        Fetches inventory levels for a specific inventory_item_id from Shopify.
+
+        Args:
+            inventory_item_id (str | int): The Shopify inventory item ID.
+
+        Returns:
+            list: A list of dicts, e.g., [{'location_id': ..., 'available': ...}, ...]
+                  Returns an empty list on error.
+        """
+        if not inventory_item_id:
+            _logger.warning("Cannot fetch inventory levels without an inventory_item_id.")
+            return []
+
+        shopify_access_token = self.env['ir.config_parameter'].sudo().get_param('shopify.access_token')
+        shopify_store_url = self.env['ir.config_parameter'].sudo().get_param('shopify.store_url')
+
+        if not shopify_access_token or not shopify_store_url:
+            _logger.error("Missing Shopify credentials for inventory level fetching.")
+            return []
+
+        inventory_url = f"https://{shopify_store_url}/admin/api/2023-01/inventory_levels.json"
+        headers = {"X-Shopify-Access-Token": shopify_access_token}
+        params = {"inventory_item_ids": str(inventory_item_id)}
+
+        inventory_levels = []
+        try:
+            _logger.info(f"Fetching inventory levels for item ID: {inventory_item_id}")
+            response = requests.get(inventory_url, headers=headers, params=params, timeout=15)
+
+            if response.status_code == 429:
+                 retry_after = int(response.headers.get('Retry-After', 10))
+                 _logger.warning(f"Rate limit hit fetching inventory for item {inventory_item_id}, waiting {retry_after} seconds")
+                 time.sleep(retry_after)
+                 return self._fetch_shopify_inventory_levels(inventory_item_id) # Retry
+
+            response.raise_for_status() # Raise HTTPError for other bad responses
+
+            data = response.json()
+            inventory_levels = data.get("inventory_levels", [])
+            _logger.info(f"Received {len(inventory_levels)} inventory level records for item ID: {inventory_item_id}")
+
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Error fetching Shopify inventory levels for item ID {inventory_item_id}: {e}")
+        except Exception as e:
+             _logger.exception(f"Unexpected error processing Shopify inventory levels for item ID {inventory_item_id}: {e}")
+
+        return inventory_levels
+
+
+    @api.model
+    def _fetch_shopify_inventory_item_cost(self, inventory_item_id):
+        """
+        Fetches the cost associated with a specific inventory_item_id from Shopify.
+
+        Args:
+            inventory_item_id (str | int): The Shopify inventory item ID.
+
+        Returns:
+            float: The cost value, or 0.0 if not found or on error.
+        """
+        if not inventory_item_id:
+            _logger.warning("Cannot fetch inventory item cost without an inventory_item_id.")
+            return 0.0
+
+        shopify_access_token = self.env['ir.config_parameter'].sudo().get_param('shopify.access_token')
+        shopify_store_url = self.env['ir.config_parameter'].sudo().get_param('shopify.store_url')
+
+        if not shopify_access_token or not shopify_store_url:
+            _logger.error("Missing Shopify credentials for inventory item cost fetching.")
+            return 0.0
+
+        item_url = f"https://{shopify_store_url}/admin/api/2023-01/inventory_items/{inventory_item_id}.json"
+        headers = {"X-Shopify-Access-Token": shopify_access_token}
+
+        cost = 0.0
+        try:
+            _logger.info(f"Fetching inventory item data for cost - Item ID: {inventory_item_id}")
+            response = requests.get(item_url, headers=headers, timeout=15)
+
+            if response.status_code == 429:
+                 retry_after = int(response.headers.get('Retry-After', 10))
+                 _logger.warning(f"Rate limit hit fetching inventory item {inventory_item_id}, waiting {retry_after} seconds")
+                 time.sleep(retry_after)
+                 return self._fetch_shopify_inventory_item_cost(inventory_item_id) # Retry
+
+            response.raise_for_status() # Raise HTTPError for other bad responses
+
+            data = response.json()
+            inventory_item = data.get("inventory_item", {})
+            cost_str = inventory_item.get("cost") # Cost is usually a string here
+            if cost_str is not None:
+                try:
+                    cost = float(cost_str)
+                    _logger.info(f"  Found cost '{cost_str}' for item ID {inventory_item_id}")
+                except (ValueError, TypeError):
+                     _logger.warning(f"  Could not convert cost '{cost_str}' to float for item ID {inventory_item_id}.")
+            else:
+                 _logger.warning(f"  'cost' field not found in inventory item data for ID {inventory_item_id}.")
+
+
+        except requests.exceptions.RequestException as e:
+            _logger.error(f"Error fetching Shopify inventory item for ID {inventory_item_id}: {e}")
+        except Exception as e:
+             _logger.exception(f"Unexpected error processing Shopify inventory item for ID {inventory_item_id}: {e}")
+
+        return cost
+
 
     @api.model
     def _auto_sync_products(self):
@@ -105,6 +339,13 @@ class ShopifySync(models.Model):
         _logger.info(f"Starting Shopify product sync (batch size: {batch_size})...")
         last_sync_time = self.env['ir.config_parameter'].sudo().get_param('shopify.last_sync_time')
         current_sync_time = datetime.now().isoformat()
+
+        # --- Get Location Mapping ---
+        location_mapping = self._get_odoo_shopify_location_mapping()
+        if not location_mapping:
+             _logger.warning("Could not obtain Shopify location mapping. Inventory sync will be skipped for this run.")
+        # --- End Location Mapping ---
+
         shopify_products = self.fetch_shopify_products(last_sync_time, batch_size)
 
         if len(shopify_products) > 0:
@@ -197,14 +438,16 @@ class ShopifySync(models.Model):
                 sku = variant.get("sku", "")
                 barcode = variant.get("barcode", "")
                 variant_price = float(variant.get("price", 0.0))
-                variant_cost = float(variant.get("cost", 0.0))
-                variant_weight = float(variant.get("weight", 0.0))
-                inventory_quantity = variant.get("inventory_quantity", 0)
+                # variant_cost = float(variant.get("cost", 0.0)) # Cost is likely on InventoryItem
+                variant_weight_value = float(variant.get("weight", 0.0)) # Store original value
+                variant_weight_unit = variant.get("weight_unit", "kg") # Get unit, default kg
+                inventory_quantity = variant.get("inventory_quantity", 0) # Note: Likely total, use inventory levels API
+                inventory_item_id = variant.get("inventory_item_id") # Fetch inventory item ID here
                 variant_image_id = variant.get("image_id")
 
-                # --- DEBUG LOGGING ---
-                _logger.info(f"Processing Variant - SKU: {sku}, Price: {variant_price}, Cost: {variant_cost}, Qty: {inventory_quantity}, Image ID: {variant_image_id}")
-                # --- END DEBUG LOGGING ---
+                # --- Fetch Cost from Inventory Item ---
+                actual_cost = self._fetch_shopify_inventory_item_cost(inventory_item_id)
+                # --- End Fetch Cost ---
 
                 if not sku and len(product.get("variants", [])) > 1:
                      _logger.warning(f"Skipping variant for product '{product['title']}' (Shopify ID: {shopify_product_id}) due to missing SKU in multi-variant product.")
@@ -277,8 +520,8 @@ class ShopifySync(models.Model):
                     'product_tmpl_id': existing_template.id,
                     'default_code': sku,
                     'barcode': barcode if barcode else None,
-                    'standard_price': variant_cost,
-                    'weight': variant_weight,
+                    'standard_price': actual_cost, # Use cost fetched from InventoryItem
+                    'weight': _convert_weight_to_kg(variant_weight_value, variant_weight_unit), # Use conversion helper
                     'active': True,
                 }
 
@@ -359,50 +602,62 @@ class ShopifySync(models.Model):
                         _logger.warning(f"  Could not find PTAV record for value ID {value_id} on template {existing_template.name} to set price_extra.")
 
 
-                # --- Handle Inventory ---
-                shopify_location_name = 'Default Shopify Location' # Placeholder
-                odoo_location = LocationModel.search([
-                    ('name', '=', shopify_location_name), ('usage', '=', 'internal'),
-                    ('company_id', '=', self.env.company.id)
-                ], limit=1)
-                if not odoo_location:
-                    odoo_location = LocationModel.create({
-                        'name': shopify_location_name, 'usage': 'internal', 'company_id': self.env.company.id,
-                    })
-                    _logger.info(f"Created Odoo stock location: {shopify_location_name}")
+                # --- Handle Inventory (Multi-Location) ---
+                if location_mapping: # Only proceed if we have a location map
+                    inventory_item_id = variant.get("inventory_item_id")
+                    if inventory_item_id:
+                        shopify_levels = self._fetch_shopify_inventory_levels(inventory_item_id)
+                        if shopify_levels:
+                            _logger.info(f"Processing {len(shopify_levels)} inventory levels for SKU {sku} (Item ID: {inventory_item_id})")
+                            updated_odoo_location_ids = set() # Keep track of locations updated for this variant
 
-                try:
-                    # --- DEBUG LOGGING ---
-                    _logger.info(f"Inventory Update for SKU {sku}: Target Product ID: {existing_variant.id}, Target Location ID: {odoo_location.id}, Shopify Qty: {inventory_quantity}")
-                    # --- END DEBUG LOGGING ---
-                    current_quant = InventoryModel.search([
-                        ('product_id', '=', existing_variant.id), ('location_id', '=', odoo_location.id)
-                    ])
-                    if current_quant:
-                         # --- DEBUG LOGGING ---
-                         _logger.info(f"  Found existing quant (ID: {current_quant.id}) with quantity {current_quant.quantity}. Comparing with Shopify Qty {inventory_quantity}.")
-                         # --- END DEBUG LOGGING ---
-                         if current_quant.quantity != inventory_quantity:
-                              # --- DEBUG LOGGING ---
-                              _logger.info(f"  Quantities differ. Attempting to update quant ID {current_quant.id} to {inventory_quantity}.")
-                              # --- END DEBUG LOGGING ---
-                              current_quant.sudo().write({'inventory_quantity': inventory_quantity})
-                              _logger.info(f"  Successfully updated inventory for {sku} at {odoo_location.name} to {inventory_quantity}")
-                         else:
-                              _logger.info(f"  Quantities match. No inventory update needed for {sku}.")
-                    elif inventory_quantity > 0:
-                         # --- DEBUG LOGGING ---
-                         _logger.info(f"  No existing quant found. Attempting to create new quant with quantity {inventory_quantity}.")
-                         # --- END DEBUG LOGGING ---
-                         new_quant = InventoryModel.sudo().create({
-                             'product_id': existing_variant.id, 'location_id': odoo_location.id,
-                             'inventory_quantity': inventory_quantity,
-                         })
-                         _logger.info(f"  Successfully set initial inventory (Quant ID: {new_quant.id}) for {sku} at {odoo_location.name} to {inventory_quantity}")
+                            for level in shopify_levels:
+                                shopify_loc_id_str = str(level.get('location_id'))
+                                available_qty = level.get('available', 0) # Default to 0 if 'available' key is missing
+
+                                # --- DEBUG LOGGING ---
+                                _logger.info(f"  Processing Inv Level - Shopify Loc ID: {shopify_loc_id_str}, Available Qty: {available_qty}")
+                                # --- END DEBUG LOGGING ---
+
+                                odoo_location_id = location_mapping.get(shopify_loc_id_str)
+
+                                if odoo_location_id:
+                                    # --- DEBUG LOGGING ---
+                                    _logger.info(f"    Mapped to Odoo Loc ID: {odoo_location_id}")
+                                    # --- END DEBUG LOGGING ---
+                                    updated_odoo_location_ids.add(odoo_location_id)
+                                    try:
+                                        _logger.info(f"  Attempting to set inventory for SKU {sku} (Product ID {existing_variant.id}) at Odoo Loc ID {odoo_location_id} to {available_qty} using _update_available_quantity")
+                                        # Use _update_available_quantity, ensuring we pass recordsets
+                                        location_record = self.env['stock.location'].browse(odoo_location_id)
+                                        if not location_record.exists():
+                                            _logger.error(f"    Could not find stock.location record for ID {odoo_location_id}. Skipping inventory update.")
+                                            continue # Skip this level if location record not found
+
+                                        # Ensure product_id is also a recordset (should be already, but safer)
+                                        product_record = self.env['product.product'].browse(existing_variant.id)
+                                        if not product_record.exists():
+                                             _logger.error(f"    Could not find product.product record for ID {existing_variant.id}. Skipping inventory update.")
+                                             continue
+
+                                        InventoryModel.sudo()._update_available_quantity(
+                                            product_record,  # Pass product.product recordset
+                                            location_record, # Pass stock.location recordset
+                                            available_qty    # Pass quantity
+                                        )
+                                        _logger.info(f"    Called _update_available_quantity for SKU {sku} at Odoo Loc ID {odoo_location_id} to {available_qty}")
+                                    except Exception as e_inv:
+                                        _logger.exception(f"  Error applying inventory adjustment for SKU {sku} at Odoo Loc ID {odoo_location_id}: {e_inv}")
+                                else:
+                                    _logger.warning(f"  Could not find mapped Odoo location for Shopify Location ID {shopify_loc_id_str}. Skipping inventory update for this location.")
+
+                        else:
+                             _logger.warning(f"Could not fetch inventory levels for SKU {sku} (Item ID: {inventory_item_id}). Inventory sync skipped for this variant.")
                     else:
-                         _logger.info(f"  No existing quant found and Shopify quantity is {inventory_quantity}. No inventory record created/updated for {sku}.")
-                except Exception as e:
-                    _logger.exception(f"Error updating inventory for variant {sku}: {str(e)}")
+                        _logger.warning(f"Shopify variant data for SKU {sku} is missing 'inventory_item_id'. Inventory sync skipped.")
+                else:
+                     _logger.warning("Location mapping not available. Inventory sync skipped for variant SKU {sku}.")
+
 
             # --- Optional: Deactivate Odoo variants not present in Shopify ---
             # ...
@@ -437,3 +692,19 @@ class ProductProduct(models.Model):
         index=True,
         help="Technical field to link variant to Shopify Product ID on template"
     )
+
+
+# Add shopify_location_id to stock.location for mapping
+class StockLocation(models.Model):
+    _inherit = "stock.location"
+
+    shopify_location_id = fields.Char("Shopify Location ID", index=True, copy=False, readonly=True,
+                                     help="Technical field to link Odoo Stock Locations to Shopify Locations.")
+
+
+# Add shopify_location_id to stock.warehouse for mapping
+class StockWarehouse(models.Model):
+    _inherit = "stock.warehouse"
+
+    shopify_location_id = fields.Char("Shopify Location ID", index=True, copy=False, readonly=True,
+                                     help="Technical field to link Odoo Warehouses to Shopify Locations.")
