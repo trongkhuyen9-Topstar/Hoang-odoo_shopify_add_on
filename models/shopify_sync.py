@@ -157,25 +157,25 @@ class ShopifySync(models.Model):
                 except Exception as e:
                     _logger.warning(f"Failed to fetch main image for {product['title']}: {str(e)}")
 
-            tax_lines = product.get('tax_lines', [])
-            if tax_lines:
-                taxes = []
-                for tax_line in tax_lines:
-                    tax_name = tax_line.get('title')
-                    tax_rate = tax_line.get('rate')
-                    if tax_name and tax_rate is not None:
-                        tax = TaxModel.search([
-                            ('name', '=', tax_name), ('amount', '=', tax_rate * 100),
-                            ('type_tax_use', '=', 'sale'), ('company_id', '=', self.env.company.id)
-                        ], limit=1)
-                        if not tax:
-                            tax = TaxModel.create({
-                                'name': tax_name, 'amount': tax_rate * 100, 'amount_type': 'percent',
-                                'type_tax_use': 'sale', 'company_id': self.env.company.id,
-                            })
-                        taxes.append(tax.id)
-                if taxes:
-                    template_data['taxes_id'] = [(6, 0, taxes)]
+            # tax_lines = product.get('tax_lines', [])
+            # if tax_lines:
+            #     taxes = []
+            #     for tax_line in tax_lines:
+            #         tax_name = tax_line.get('title')
+            #         tax_rate = tax_line.get('rate')
+            #         if tax_name and tax_rate is not None:
+            #             tax = TaxModel.search([
+            #                 ('name', '=', tax_name), ('amount', '=', tax_rate * 100),
+            #                 ('type_tax_use', '=', 'sale'), ('company_id', '=', self.env.company.id)
+            #             ], limit=1)
+            #             if not tax:
+            #                 tax = TaxModel.create({
+            #                     'name': tax_name, 'amount': tax_rate * 100, 'amount_type': 'percent',
+            #                     'type_tax_use': 'sale', 'company_id': self.env.company.id,
+            #                 })
+            #             taxes.append(tax.id)
+            #     if taxes:
+            #         template_data['taxes_id'] = [(6, 0, taxes)]
 
             if existing_template:
                 existing_template.write(template_data)
