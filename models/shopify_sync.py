@@ -202,7 +202,9 @@ class ShopifySync(models.Model):
                 inventory_quantity = variant.get("inventory_quantity", 0)
                 variant_image_id = variant.get("image_id")
 
-                _logger.info(f"Processing Variant - SKU: {sku}, Price: {variant_price}, Image ID: {variant_image_id}")
+                # --- DEBUG LOGGING ---
+                _logger.info(f"Processing Variant - SKU: {sku}, Price: {variant_price}, Cost: {variant_cost}, Qty: {inventory_quantity}, Image ID: {variant_image_id}")
+                # --- END DEBUG LOGGING ---
 
                 if not sku and len(product.get("variants", [])) > 1:
                      _logger.warning(f"Skipping variant for product '{product['title']}' (Shopify ID: {shopify_product_id}) due to missing SKU in multi-variant product.")
@@ -306,7 +308,9 @@ class ShopifySync(models.Model):
 
                 if existing_variant:
                     _logger.debug(f"Writing variant data for existing variant {existing_variant.id} (SKU: {sku})") # LOGGING ADDED
-                    existing_variant.write(variant_data)
+                    # --- ADDED sudo() ---
+                    existing_variant.sudo().write(variant_data)
+                    # --- END sudo() ---
                     _logger.info(f"Updated variant: SKU {sku} for template {existing_template.name}")
                     processed_variant_ids.add(existing_variant.id)
                 else:
@@ -324,7 +328,9 @@ class ShopifySync(models.Model):
 
                     if existing_variant:
                          _logger.debug(f"Writing variant data for existing variant {existing_variant.id} (found after template update, SKU: {sku})") # LOGGING ADDED
-                         existing_variant.write(variant_data)
+                         # --- ADDED sudo() ---
+                         existing_variant.sudo().write(variant_data)
+                         # --- END sudo() ---
                          _logger.info(f"Updated variant (found after template update): SKU {sku}")
                          processed_variant_ids.add(existing_variant.id)
                     else:
@@ -366,19 +372,35 @@ class ShopifySync(models.Model):
                     _logger.info(f"Created Odoo stock location: {shopify_location_name}")
 
                 try:
+                    # --- DEBUG LOGGING ---
+                    _logger.info(f"Inventory Update for SKU {sku}: Target Product ID: {existing_variant.id}, Target Location ID: {odoo_location.id}, Shopify Qty: {inventory_quantity}")
+                    # --- END DEBUG LOGGING ---
                     current_quant = InventoryModel.search([
                         ('product_id', '=', existing_variant.id), ('location_id', '=', odoo_location.id)
                     ])
                     if current_quant:
+                         # --- DEBUG LOGGING ---
+                         _logger.info(f"  Found existing quant (ID: {current_quant.id}) with quantity {current_quant.quantity}. Comparing with Shopify Qty {inventory_quantity}.")
+                         # --- END DEBUG LOGGING ---
                          if current_quant.quantity != inventory_quantity:
+                              # --- DEBUG LOGGING ---
+                              _logger.info(f"  Quantities differ. Attempting to update quant ID {current_quant.id} to {inventory_quantity}.")
+                              # --- END DEBUG LOGGING ---
                               current_quant.sudo().write({'inventory_quantity': inventory_quantity})
-                              _logger.info(f"Updated inventory for {sku} at {odoo_location.name} to {inventory_quantity}")
+                              _logger.info(f"  Successfully updated inventory for {sku} at {odoo_location.name} to {inventory_quantity}")
+                         else:
+                              _logger.info(f"  Quantities match. No inventory update needed for {sku}.")
                     elif inventory_quantity > 0:
-                         InventoryModel.sudo().create({
+                         # --- DEBUG LOGGING ---
+                         _logger.info(f"  No existing quant found. Attempting to create new quant with quantity {inventory_quantity}.")
+                         # --- END DEBUG LOGGING ---
+                         new_quant = InventoryModel.sudo().create({
                              'product_id': existing_variant.id, 'location_id': odoo_location.id,
                              'inventory_quantity': inventory_quantity,
                          })
-                         _logger.info(f"Set initial inventory for {sku} at {odoo_location.name} to {inventory_quantity}")
+                         _logger.info(f"  Successfully set initial inventory (Quant ID: {new_quant.id}) for {sku} at {odoo_location.name} to {inventory_quantity}")
+                    else:
+                         _logger.info(f"  No existing quant found and Shopify quantity is {inventory_quantity}. No inventory record created/updated for {sku}.")
                 except Exception as e:
                     _logger.exception(f"Error updating inventory for variant {sku}: {str(e)}")
 
