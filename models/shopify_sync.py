@@ -263,7 +263,7 @@ class ShopifySync(models.Model):
         return self.sync_products_to_odoo()
 
     @api.model
-    def fetch_shopify_products(self, last_sync_time=None, batch_size=50):
+    def fetch_shopify_products(self, last_sync_time=None, batch_size=10):
         """
         Fetch Shopify products with pagination, sorted by `updated_at` ascending
 
@@ -332,7 +332,7 @@ class ShopifySync(models.Model):
         return all_products
 
     @api.model
-    def sync_products_to_odoo(self, batch_size=50):
+    def sync_products_to_odoo(self, batch_size=10):
         """
         Sync Shopify products & inventory to Odoo
         """
@@ -640,12 +640,16 @@ class ShopifySync(models.Model):
                                              _logger.error(f"    Could not find product.product record for ID {existing_variant.id}. Skipping inventory update.")
                                              continue
 
-                                        InventoryModel.sudo()._update_available_quantity(
-                                            product_record,  # Pass product.product recordset
-                                            location_record, # Pass stock.location recordset
-                                            available_qty    # Pass quantity
-                                        )
-                                        _logger.info(f"    Called _update_available_quantity for SKU {sku} at Odoo Loc ID {odoo_location_id} to {available_qty}")
+                                        # Ensure available_qty is not None before attempting update
+                                        if available_qty is not None:
+                                            InventoryModel.sudo()._update_available_quantity(
+                                                product_record,  # Pass product.product recordset
+                                                location_record, # Pass stock.location recordset
+                                                available_qty    # Pass quantity
+                                            )
+                                            _logger.info(f"    Called _update_available_quantity for SKU {sku} at Odoo Loc ID {odoo_location_id} to {available_qty}")
+                                        else:
+                                            _logger.warning(f"    Skipping inventory update for SKU {sku} at Odoo Loc ID {odoo_location_id} because available_qty is None.")
                                     except Exception as e_inv:
                                         _logger.exception(f"  Error applying inventory adjustment for SKU {sku} at Odoo Loc ID {odoo_location_id}: {e_inv}")
                                 else:
