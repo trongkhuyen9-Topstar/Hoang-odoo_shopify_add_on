@@ -71,7 +71,7 @@
         <menuitem
             id="menu_shopify_order_status"
             name="Order Statuses"
-            parent="menu_shopify_root"
+            parent="menu_shopify_sync"
             action="action_shopify_order_status"
             sequence="20"/>
         <!-- Cron Job for Auto Sync -->
