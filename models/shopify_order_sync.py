@@ -169,7 +169,7 @@ class ShopifyOrderStatus(models.Model):
 
         for order_data in orders_batch:
             shopify_id = str(order_data['id'])
-            _logger.debug(f"Processing Shopify Order ID: {shopify_id}")
+            _logger.info(f"Processing Shopify Order ID: {shopify_id}") # Changed to INFO
 
             vals = {
                 'shopify_order_id': shopify_id,
@@ -186,11 +186,11 @@ class ShopifyOrderStatus(models.Model):
                 if existing_record:
                     existing_record.write(vals)
                     total_updated += 1
-                    _logger.debug(f"Updated status for Shopify Order ID: {shopify_id}")
+                    _logger.info(f"Updated status for Shopify Order ID: {shopify_id}") # Changed to INFO
                 else:
                     self.create(vals)
                     total_created += 1
-                    _logger.debug(f"Created status record for Shopify Order ID: {shopify_id}")
+                    _logger.info(f"Created status record for Shopify Order ID: {shopify_id}") # Changed to INFO
 
                 total_processed += 1
                 # Track the updated_at of the last successfully processed order

@@ -146,55 +146,90 @@ class ShopifySync(models.Model):
 
 
     @api.model
-    def _fetch_shopify_inventory_levels(self, inventory_item_id):
+    def _fetch_shopify_inventory_levels(self, inventory_item_ids):
         """
-        Fetches inventory levels for a specific inventory_item_id from Shopify.
+        Fetches inventory levels for a list of inventory_item_ids from Shopify in a single call.
 
         Args:
-            inventory_item_id (str | int): The Shopify inventory item ID.
+            inventory_item_ids (list[str | int]): A list of Shopify inventory item IDs.
 
         Returns:
-            list: A list of dicts, e.g., [{'location_id': ..., 'available': ...}, ...]
-                  Returns an empty list on error.
+            dict: A dictionary mapping inventory_item_id (str) to its list of inventory levels
+                  (e.g., [{'location_id': ..., 'available': ...}, ...]).
+                  Returns an empty dict if no IDs are provided or on error.
         """
-        if not inventory_item_id:
-            _logger.warning("Cannot fetch inventory levels without an inventory_item_id.")
-            return []
+        if not inventory_item_ids:
+            _logger.warning("Cannot fetch inventory levels without inventory_item_ids.")
+            return {}
+
+        # Ensure all IDs are strings for joining and dictionary keys
+        item_ids_str_list = [str(item_id) for item_id in inventory_item_ids if item_id]
+        if not item_ids_str_list:
+             _logger.warning("No valid inventory_item_ids provided after filtering.")
+             return {}
+
+        item_ids_param = ",".join(item_ids_str_list)
 
         shopify_access_token = self.env['ir.config_parameter'].sudo().get_param('shopify.access_token')
         shopify_store_url = self.env['ir.config_parameter'].sudo().get_param('shopify.store_url')
 
         if not shopify_access_token or not shopify_store_url:
             _logger.error("Missing Shopify credentials for inventory level fetching.")
-            return []
+            return {}
+
+        # Consider pagination if fetching for a very large number of items might exceed URL length limits or response size limits.
+        # For now, assume a reasonable number of variants per product fits in one call. Max limit is 250 for inventory_levels.json.
+        # If item_ids_str_list is > 250, we'd need to batch this call too.
+        if len(item_ids_str_list) > 250:
+             _logger.warning(f"Attempting to fetch inventory levels for {len(item_ids_str_list)} items, which exceeds the Shopify limit of 250 per call. Fetching only the first 250.")
+             item_ids_param = ",".join(item_ids_str_list[:250])
+             # TODO: Implement proper batching here if needed for > 250 variants per product
 
         inventory_url = f"https://{shopify_store_url}/admin/api/2023-01/inventory_levels.json"
         headers = {"X-Shopify-Access-Token": shopify_access_token}
-        params = {"inventory_item_ids": str(inventory_item_id)}
+        # Limit can be up to 250 for inventory_levels
+        params = {"inventory_item_ids": item_ids_param, "limit": 250}
 
-        inventory_levels = []
+        all_inventory_levels = []
         try:
-            _logger.info(f"Fetching inventory levels for item ID: {inventory_item_id}")
-            response = requests.get(inventory_url, headers=headers, params=params, timeout=15)
+            _logger.info(f"Fetching inventory levels for {len(item_ids_str_list)} item IDs: {item_ids_param[:200]}...") # Log truncated list
+            # Increase timeout slightly for potentially larger response
+            response = requests.get(inventory_url, headers=headers, params=params, timeout=30)
 
             if response.status_code == 429:
                  retry_after = int(response.headers.get('Retry-After', 10))
-                 _logger.warning(f"Rate limit hit fetching inventory for item {inventory_item_id}, waiting {retry_after} seconds")
+                 _logger.warning(f"Rate limit hit fetching inventory for items {item_ids_param[:100]}..., waiting {retry_after} seconds")
                  time.sleep(retry_after)
-                 return self._fetch_shopify_inventory_levels(inventory_item_id) # Retry
+                 # Retry the same batch
+                 return self._fetch_shopify_inventory_levels(inventory_item_ids)
 
             response.raise_for_status() # Raise HTTPError for other bad responses
 
             data = response.json()
-            inventory_levels = data.get("inventory_levels", [])
-            _logger.info(f"Received {len(inventory_levels)} inventory level records for item ID: {inventory_item_id}")
+            all_inventory_levels = data.get("inventory_levels", [])
+            _logger.info(f"Received {len(all_inventory_levels)} total inventory level records for the requested item IDs.")
 
         except requests.exceptions.RequestException as e:
-            _logger.error(f"Error fetching Shopify inventory levels for item ID {inventory_item_id}: {e}")
+            _logger.error(f"Error fetching Shopify inventory levels for item IDs {item_ids_param[:100]}...: {e}")
+            return {} # Return empty dict on error
         except Exception as e:
-             _logger.exception(f"Unexpected error processing Shopify inventory levels for item ID {inventory_item_id}: {e}")
+             _logger.exception(f"Unexpected error processing Shopify inventory levels for item IDs {item_ids_param[:100]}...: {e}")
+             return {} # Return empty dict on error
 
-        return inventory_levels
+        # Group levels by inventory_item_id
+        levels_by_item_id = {}
+        for level in all_inventory_levels:
+            item_id_str = str(level.get('inventory_item_id'))
+            if item_id_str not in levels_by_item_id:
+                levels_by_item_id[item_id_str] = []
+            levels_by_item_id[item_id_str].append(level)
+
+        # Ensure all requested IDs have an entry (even if empty)
+        for item_id in item_ids_str_list:
+            if item_id not in levels_by_item_id:
+                levels_by_item_id[item_id] = []
+
+        return levels_by_item_id
 
 
     @api.model
@@ -263,7 +298,7 @@ class ShopifySync(models.Model):
         return self.sync_products_to_odoo()
 
     @api.model
-    def fetch_shopify_products(self, last_sync_time=None, batch_size=10):
+    def fetch_shopify_products(self, last_sync_time=None, batch_size=5):
         """
         Fetch Shopify products with pagination, sorted by `updated_at` ascending
 
@@ -332,7 +367,7 @@ class ShopifySync(models.Model):
         return all_products
 
     @api.model
-    def sync_products_to_odoo(self, batch_size=10):
+    def sync_products_to_odoo(self, batch_size=5):
         """
         Sync Shopify products & inventory to Odoo
         """
@@ -361,6 +396,7 @@ class ShopifySync(models.Model):
         ProductTmplAttrValueModel = self.env['product.template.attribute.value']
 
         updated_templates, created_templates, skipped_variants = 0, 0, 0
+        last_processed_product_update_time = None # Initialize before the loop
 
         for product in shopify_products:
             shopify_product_id = str(product["id"])
@@ -433,6 +469,18 @@ class ShopifySync(models.Model):
             processed_variant_ids = set()
             variant_price_extra_cmds = {}
 
+            # --- Batch Inventory Fetch ---
+            all_variant_inventory_item_ids = [
+                v.get("inventory_item_id") for v in product.get("variants", []) if v.get("inventory_item_id")
+            ]
+            _logger.info(f"Found {len(all_variant_inventory_item_ids)} inventory item IDs for product {shopify_product_id}.")
+            inventory_levels_by_item_id = {}
+            if all_variant_inventory_item_ids:
+                inventory_levels_by_item_id = self._fetch_shopify_inventory_levels(all_variant_inventory_item_ids)
+                _logger.info(f"Fetched inventory levels for {len(inventory_levels_by_item_id)} item IDs.")
+            # --- End Batch Inventory Fetch ---
+
+
             for variant in product.get("variants", []):
                 shopify_variant_id = str(variant["id"])
                 sku = variant.get("sku", "")
@@ -445,9 +493,21 @@ class ShopifySync(models.Model):
                 inventory_item_id = variant.get("inventory_item_id") # Fetch inventory item ID here
                 variant_image_id = variant.get("image_id")
 
-                # --- Fetch Cost from Inventory Item ---
-                actual_cost = self._fetch_shopify_inventory_item_cost(inventory_item_id)
-                # --- End Fetch Cost ---
+                # --- Determine Cost ---
+                actual_cost = 0.0
+                variant_cost_raw = variant.get("cost") # Check variant data first
+                if variant_cost_raw is not None:
+                    try:
+                        actual_cost = float(variant_cost_raw)
+                        _logger.info(f"  Using cost '{actual_cost}' directly from variant data for SKU {sku}.")
+                    except (ValueError, TypeError):
+                         _logger.warning(f"  Could not convert cost '{variant_cost_raw}' from variant data for SKU {sku}. Will try fetching from InventoryItem.")
+                         actual_cost = self._fetch_shopify_inventory_item_cost(inventory_item_id)
+                else:
+                     _logger.info(f"  Cost not found directly on variant data for SKU {sku}. Fetching from InventoryItem ID {inventory_item_id}.")
+                     actual_cost = self._fetch_shopify_inventory_item_cost(inventory_item_id)
+                # --- End Determine Cost ---
+
 
                 if not sku and len(product.get("variants", [])) > 1:
                      _logger.warning(f"Skipping variant for product '{product['title']}' (Shopify ID: {shopify_product_id}) due to missing SKU in multi-variant product.")
@@ -606,14 +666,22 @@ class ShopifySync(models.Model):
                 if location_mapping: # Only proceed if we have a location map
                     inventory_item_id = variant.get("inventory_item_id")
                     if inventory_item_id:
-                        shopify_levels = self._fetch_shopify_inventory_levels(inventory_item_id)
-                        if shopify_levels:
-                            _logger.info(f"Processing {len(shopify_levels)} inventory levels for SKU {sku} (Item ID: {inventory_item_id})")
+                        # Get pre-fetched levels for this variant's item ID
+                        current_variant_levels = inventory_levels_by_item_id.get(str(inventory_item_id), [])
+
+                        if current_variant_levels:
+                            _logger.info(f"Processing {len(current_variant_levels)} pre-fetched inventory levels for SKU {sku} (Item ID: {inventory_item_id})")
                             updated_odoo_location_ids = set() # Keep track of locations updated for this variant
 
-                            for level in shopify_levels:
+                            for level in current_variant_levels: # Use pre-fetched levels
                                 shopify_loc_id_str = str(level.get('location_id'))
-                                available_qty = level.get('available', 0) # Default to 0 if 'available' key is missing
+                                available_qty_raw = level.get('available')
+                                try:
+                                    # Odoo quantities are floats
+                                    available_qty = float(available_qty_raw) if available_qty_raw is not None else 0.0
+                                except (ValueError, TypeError):
+                                    _logger.warning(f"    Could not convert Shopify available quantity '{available_qty_raw}' to float for Loc ID {shopify_loc_id_str}. Defaulting to 0.0.")
+                                    available_qty = 0.0
 
                                 # --- DEBUG LOGGING ---
                                 _logger.info(f"  Processing Inv Level - Shopify Loc ID: {shopify_loc_id_str}, Available Qty: {available_qty}")
@@ -640,16 +708,36 @@ class ShopifySync(models.Model):
                                              _logger.error(f"    Could not find product.product record for ID {existing_variant.id}. Skipping inventory update.")
                                              continue
 
-                                        # Ensure available_qty is not None before attempting update
-                                        if available_qty is not None:
-                                            InventoryModel.sudo()._update_available_quantity(
-                                                product_record,  # Pass product.product recordset
-                                                location_record, # Pass stock.location recordset
-                                                available_qty    # Pass quantity
-                                            )
-                                            _logger.info(f"    Called _update_available_quantity for SKU {sku} at Odoo Loc ID {odoo_location_id} to {available_qty}")
+                                        # available_qty is now guaranteed to be a float (default 0.0)
+                                        _logger.info(f"    Attempting to set inventory for product={product_record.id}, location={location_record.id}, qty={available_qty}")
+
+                                        # Find or create the specific stock.quant record
+                                        # We use sudo() here as inventory adjustments often require higher privileges
+                                        quant = InventoryModel.sudo().search([
+                                            ('product_id', '=', product_record.id),
+                                            ('location_id', '=', location_record.id),
+                                            # Add lot_id, package_id, owner_id checks here if they become relevant
+                                        ], limit=1)
+
+                                        if quant:
+                                            # If quant exists, update inventory_quantity if different and apply
+                                            if quant.inventory_quantity != available_qty:
+                                                quant.inventory_quantity = available_qty
+                                                quant.action_apply_inventory()
+                                                _logger.info(f"    Applied inventory update (set to {available_qty}) for existing quant ID {quant.id}")
+                                            else:
+                                                _logger.info(f"    Skipped inventory update for quant ID {quant.id} - quantity already {available_qty}")
                                         else:
-                                            _logger.warning(f"    Skipping inventory update for SKU {sku} at Odoo Loc ID {odoo_location_id} because available_qty is None.")
+                                            # If quant doesn't exist, create it and apply inventory
+                                            # Odoo typically removes zero quants, but creating then applying should handle it.
+                                            quant = InventoryModel.sudo().create({
+                                                'product_id': product_record.id,
+                                                'location_id': location_record.id,
+                                                'inventory_quantity': available_qty,
+                                                # Add lot_id, package_id, owner_id here if relevant
+                                            })
+                                            quant.action_apply_inventory()
+                                            _logger.info(f"    Created new quant ID {quant.id} and applied inventory (set to {available_qty})")
                                     except Exception as e_inv:
                                         _logger.exception(f"  Error applying inventory adjustment for SKU {sku} at Odoo Loc ID {odoo_location_id}: {e_inv}")
                                 else:
@@ -662,13 +750,25 @@ class ShopifySync(models.Model):
                 else:
                      _logger.warning("Location mapping not available. Inventory sync skipped for variant SKU {sku}.")
 
+            # Track the updated_at of the last successfully processed product (inside the loop)
+            if product.get('updated_at'):
+                 last_processed_product_update_time = product.get('updated_at')
+            # --- End of 'for product in shopify_products:' loop ---
+
 
             # --- Optional: Deactivate Odoo variants not present in Shopify ---
-            # ...
 
+        # Update last_sync_time based on the last processed product's timestamp
+        if shopify_products and last_processed_product_update_time:
+            # Use the updated_at timestamp of the last product in the processed batch
+            new_last_sync_time = last_processed_product_update_time
+            self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', new_last_sync_time)
+            _logger.info(f"Set last sync time (shopify.last_sync_time) to: {new_last_sync_time}")
+        elif shopify_products:
+             _logger.warning("Processed products but could not determine the 'updated_at' of the last one. Last sync time not updated.")
+        else:
+             _logger.info("No products processed in this batch. Last sync time not updated.")
 
-        if shopify_products:
-            self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', current_sync_time)
 
         _logger.info(f"Batch sync completed: {created_templates} created templates, {updated_templates} updated templates, {skipped_variants} skipped variants.")
         return {
