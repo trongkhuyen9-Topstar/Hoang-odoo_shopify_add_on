@@ -136,7 +136,7 @@ class ShopifyOrderStatus(models.Model):
             "limit": batch_size,
             "order": "updated_at asc",
             "status": "any", # Fetch orders of any status
-            "fields": "id,order_number,financial_status,fulfillment_status,updated_at" # Only fetch needed fields
+            "fields": "id,order_number,financial_status,fulfillment_status,updated_at,total_price,customer,source_name,line_items" # Fetch needed fields for logging
         }
 
         if last_sync_time:
@@ -169,7 +169,22 @@ class ShopifyOrderStatus(models.Model):
 
         for order_data in orders_batch:
             shopify_id = str(order_data['id'])
-            _logger.info(f"Processing Shopify Order ID: {shopify_id}") # Changed to INFO
+            # Extract details for logging
+            order_no = order_data.get('order_number')
+            customer_data = order_data.get('customer') or {} # Ensure customer_data is a dict, even if customer is null
+            customer_name = f"{customer_data.get('first_name', '')} {customer_data.get('last_name', '')}".strip() or "N/A"
+            channel = order_data.get('source_name', 'N/A')
+            total = order_data.get('total_price', 'N/A')
+            payment_status = order_data.get('financial_status', 'N/A')
+            fulfillment_status = order_data.get('fulfillment_status', 'N/A')
+            item_count = len(order_data.get('line_items', []))
+
+            _logger.info(
+                f"Processing Shopify Order ID: {shopify_id} - "
+                f"Order No: {order_no}, Cust: {customer_name}, Channel: {channel}, "
+                f"Total: {total}, Payment: {payment_status}, Fulfillment: {fulfillment_status}, "
+                f"Items: {item_count}"
+            )
 
             vals = {
                 'shopify_order_id': shopify_id,
