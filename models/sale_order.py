@@ -11,6 +11,12 @@ class SaleOrder(models.Model):
         help="The unique identifier of the order from Shopify."
     )
 
+    shopify_order_number = fields.Char(
+        string="Shopify Order Number",
+        copy=False,
+        help="The human-readable order number from Shopify (e.g., #1001)."
+    )
+
     # Optional: Add constraint if you want to ensure uniqueness at the Odoo level,
     # but be cautious if multiple Odoo instances might sync from the same Shopify store.
     # _sql_constraints = [

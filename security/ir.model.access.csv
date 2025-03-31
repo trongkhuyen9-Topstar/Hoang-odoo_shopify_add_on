@@ -1,2 +1,5 @@
 id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
 access_shopify_order_status_system,Shopify Order Status System Access,model_shopify_order_status,base.group_system,1,1,1,1
+access_res_partner_shopify_sync,Partner Access for Shopify Sync,base.model_res_partner,base.group_system,1,1,1,1
+access_sale_order_shopify_sync,Sale Order Access for Shopify Sync,sale.model_sale_order,base.group_system,1,1,1,1
+access_sale_order_line_shopify_sync,Sale Order Line Access for Shopify Sync,sale.model_sale_order_line,base.group_system,1,1,1,1
