@@ -318,7 +318,8 @@ class ShopifySync(models.Model):
 
         params = {
             "limit": batch_size,
-            "order": "updated_at asc"
+            "order": "updated_at asc",
+            "status": "active" # Fetch only active products
         }
 
         if last_sync_time:
