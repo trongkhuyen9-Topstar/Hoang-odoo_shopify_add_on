@@ -789,7 +789,7 @@ class ProductTemplate(models.Model):
 class ProductProduct(models.Model):
     _inherit = "product.product"
 
-    # shopify_variant_id = fields.Char("Shopify Variant ID", index=True) # Add if needed
+    shopify_variant_id = fields.Char("Shopify Variant ID", index=True) # Add if needed
     shopify_product_id = fields.Char(
         "Shopify Product ID",
         related='product_tmpl_id.shopify_product_id',

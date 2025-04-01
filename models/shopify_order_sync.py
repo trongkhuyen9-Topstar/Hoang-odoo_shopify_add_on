@@ -506,10 +506,12 @@ class ShopifyOrderStatus(models.Model):
 
                     # Find Odoo product
                     odoo_product = None
-                    if sku:
+                    # Prioritize Shopify Variant ID
+                    if variant_id and 'shopify_variant_id' in ProductProduct._fields:
+                        odoo_product = ProductProduct.search([('shopify_variant_id', '=', variant_id)], limit=1)
+                    # Fallback to SKU if not found by Variant ID
+                    if not odoo_product and sku:
                         odoo_product = ProductProduct.search([('default_code', '=', sku)], limit=1)
-                    if not odoo_product and variant_id and 'shopify_variant_id' in ProductProduct._fields:
-                         odoo_product = ProductProduct.search([('shopify_variant_id', '=', variant_id)], limit=1)
 
                     if not odoo_product:
                         msg = f"Line '{line_name}': Could not find matching Odoo product (SKU: {sku or 'N/A'}, VarID: {variant_id or 'N/A'}). Skipping line."
