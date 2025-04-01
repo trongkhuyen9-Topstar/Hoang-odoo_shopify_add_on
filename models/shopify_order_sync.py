@@ -393,7 +393,7 @@ class ShopifyOrderStatus(models.Model):
 
         params = {
             "limit": batch_size,
-            "order": "updated_at asc",
+            "order": "updated_at desc",
             "status": "any", # Fetch orders of any status
             # Fetch fields needed for customer, order, lines, addresses, taxes, shipping, discounts
             "fields": (
