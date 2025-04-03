@@ -75,18 +75,18 @@
             action="action_shopify_order_status"
             sequence="20"/>
         <!-- Cron Job for Auto Sync -->
-        <record id="ir_cron_sync_shopify_order_status" model="ir.cron">
-            <field name="name">Shopify: Sync Orders</field> <!-- Updated name -->
+        <!-- <record id="ir_cron_sync_shopify_order_status" model="ir.cron">
+            <field name="name">Shopify: Sync Orders</field> 
             <field name="model_id" ref="model_shopify_order_status"/>
             <field name="state">code</field>
-            <field name="code">model._auto_sync_orders()</field> <!-- Updated method call -->
+            <field name="code">model._auto_sync_orders()</field> 
             <field name="user_id" ref="base.user_root"/>
-            <field name="interval_number">4</field> <!-- Adjust frequency as needed -->
+            <field name="interval_number">4</field> <
             <field name="interval_type">hours</field>
             <field name="numbercall">-1</field>
             <field name="doall" eval="False"/>
-            <field name="active" eval="False"/> <!-- Set to False initially if preferred -->
-        </record>
+            <field name="active" eval="False"/> 
+        </record> -->
 
     </data>
 </odoo>

@@ -31,12 +31,13 @@ class OdooSync(models.Model):
 		return self.sync_products_to_shopify()
 
 	@api.model
-	def sync_products_to_shopify(self, product_ids=None):
+	def sync_products_to_shopify(self, template_ids=None):
 		"""
-		Sync Odoo products to Shopify
-		
+		Sync Odoo product templates (and their variants) to Shopify.
+
 		Args:
-			product_ids: Specific product IDs to sync, or None for modified products
+			template_ids (list, optional): Specific product.template IDs to sync.
+				If None, syncs templates modified since the last sync. Defaults to None.
 		"""
 		_logger.info("Starting Odoo to Shopify product sync...")
 		
@@ -55,137 +56,221 @@ class OdooSync(models.Model):
 			"Content-Type": "application/json"
 		}
 		
-		# If product_ids is provided, sync those specific products
-		# Otherwise, sync products modified since last sync
-		ProductModel = self.env['product.product']
-		
-		if product_ids:
-			products_to_sync = ProductModel.browse(product_ids)
-			_logger.info(f"Syncing {len(products_to_sync)} specific products to Shopify")
+		# Record sync start time
+		sync_start_time = fields.Datetime.now()
+
+		TemplateModel = self.env['product.template']
+		templates_to_sync = None
+
+		if template_ids:
+			templates_to_sync = TemplateModel.browse(template_ids)
+			_logger.info(f"Syncing {len(templates_to_sync)} specific product templates to Shopify.")
 		else:
-			# Get timestamp from previous sync to Shopify
 			last_sync_to_shopify = self.env['ir.config_parameter'].sudo().get_param('shopify.last_export_time')
-			
+			domain = [('active', '=', True)] # Always sync active templates
+
 			if last_sync_to_shopify:
-				products_to_sync = ProductModel.search([
-					('write_date', '>', last_sync_to_shopify),
-					('active', '=', True)
-				], limit=20)
-				_logger.info(f"Found {len(products_to_sync)} products modified since {last_sync_to_shopify}")
+				# Find templates modified OR whose variants were modified since last sync
+				domain = ['|',
+						  ('write_date', '>', last_sync_to_shopify),
+						  ('product_variant_ids.write_date', '>', last_sync_to_shopify)
+						 ] + domain
+				_logger.info(f"Searching for templates/variants modified since {last_sync_to_shopify}")
+				templates_to_sync = TemplateModel.search(domain, limit=1) # Limit to 1 per cron run
+				_logger.info(f"Found {len(templates_to_sync)} templates potentially modified since last sync.")
 			else:
-				# First-time sync, start with a reasonable batch
-				products_to_sync = ProductModel.search([('active', '=', True)], limit=50)
-				_logger.info(f"First-time sync, processing first {len(products_to_sync)} active products")
-				
+				# First-time sync or no timestamp found
+				templates_to_sync = TemplateModel.search(domain, limit=1) # Limit to 1 per cron run
+				_logger.info(f"First-time sync or no timestamp, processing first {len(templates_to_sync)} active templates.")
+
+		if not templates_to_sync:
+			_logger.info("No product templates found to sync.")
+			# Update timestamp even if nothing synced to avoid re-checking unchanged records
+			self.env['ir.config_parameter'].sudo().set_param('shopify.last_export_time', sync_start_time)
+			return {"status": "success", "message": "No products needed syncing.", "created": 0, "updated": 0, "failed": 0}
 		created, updated, failed = 0, 0, 0
 		
-		for product in products_to_sync:
+		sync_errors = [] # Collect errors for summary
+
+		for template in templates_to_sync:
 			try:
-				# Prepare product data for Shopify API
-				product_data = self._prepare_shopify_product_data(product)
-				
-				# Check if product already exists in Shopify
-				_logger.info(f"product.shopify_product_id: {product.shopify_product_id}")
-				if product.shopify_product_id and isinstance(product.shopify_product_id, str) and product.shopify_product_id.isdigit():
-					# Update existing product
-					product_url = f"https://{shopify_store_url}/admin/api/2023-01/products/{product.shopify_product_id}.json"
-					response = requests.put(
-						product_url,
-						headers=headers,
-						data=json.dumps({"product": product_data})
-					)
-					
-					if response.status_code in [200, 201]:
+				# Prepare template data (including variants) for Shopify API
+				product_data = self._prepare_shopify_product_data(template)
+				if not product_data: # Skip if preparation failed (e.g., no active variants)
+					_logger.warning(f"Skipping template {template.name} (ID: {template.id}) due to preparation issues.")
+					continue
+
+				shopify_product_id = template.shopify_product_id
+				response = None
+
+				if shopify_product_id and shopify_product_id.isdigit():
+					# --- Update Existing Product ---
+					_logger.info(f"Attempting to update template '{template.name}' (Odoo ID: {template.id}) in Shopify (Shopify ID: {shopify_product_id}).")
+					product_url = f"https://{shopify_store_url}/admin/api/2023-01/products/{shopify_product_id}.json"
+					# Ensure 'id' is included for updates if needed by API, but usually it's in the URL
+					# product_data['id'] = int(shopify_product_id) # Usually not needed for PUT
+					payload = json.dumps({"product": product_data})
+					response = requests.put(product_url, headers=headers, data=payload)
+
+					if response.status_code == 200:
 						updated += 1
-						_logger.info(f"Updated product in Shopify: {product.name} (ID: {product.shopify_product_id})")
+						_logger.info(f"Successfully updated template '{template.name}' in Shopify (Shopify ID: {shopify_product_id}).")
+						# Update Odoo variant IDs from response
+						self._update_odoo_variant_ids(template, response.json().get("product", {}))
 					else:
 						failed += 1
-						_logger.error(f"Failed to update product {product.name} in Shopify: {response.status_code} - {response.text}")
-						
+						error_msg = f"Failed to update template '{template.name}' (Odoo ID: {template.id}, Shopify ID: {shopify_product_id}) in Shopify: {response.status_code} - {response.text}"
+						_logger.error(error_msg)
+						sync_errors.append(error_msg)
+
 				else:
-					# Create new product
+					# --- Create New Product ---
+					_logger.info(f"Attempting to create template '{template.name}' (Odoo ID: {template.id}) in Shopify.")
 					product_url = f"https://{shopify_store_url}/admin/api/2023-01/products.json"
-					response = requests.post(
-						product_url,
-						headers=headers,
-						data=json.dumps({"product": product_data})
-					)
-					
-					if response.status_code in [200, 201]:
-						shopify_product = response.json().get("product", {})
-						shopify_product_id = str(shopify_product.get("id"))
-						
-						# Store Shopify ID in Odoo product
-						product.write({"shopify_product_id": shopify_product_id})
-						
+					payload = json.dumps({"product": product_data})
+					response = requests.post(product_url, headers=headers, data=payload)
+
+					if response.status_code == 201: # Status code for successful creation
 						created += 1
-						_logger.info(f"Created new product in Shopify: {product.name} (Shopify ID: {shopify_product_id})")
+						shopify_product_resp = response.json().get("product", {})
+						new_shopify_product_id = str(shopify_product_resp.get("id"))
+						_logger.info(f"Successfully created template '{template.name}' in Shopify (New Shopify ID: {new_shopify_product_id}).")
+
+						# Store Shopify Product ID on template and Variant IDs on variants
+						template.write({"shopify_product_id": new_shopify_product_id})
+						self._update_odoo_variant_ids(template, shopify_product_resp) # Pass response to map variants
+
 					else:
 						failed += 1
-						_logger.error(f"Failed to create product {product.name} in Shopify: {response.status_code} - {response.text}")
-				
+						error_msg = f"Failed to create template '{template.name}' (Odoo ID: {template.id}) in Shopify: {response.status_code} - {response.text}"
+						_logger.error(error_msg)
+						sync_errors.append(error_msg)
+
+			except requests.exceptions.RequestException as e:
+				failed += 1
+				error_msg = f"Network error syncing template '{template.name}' (Odoo ID: {template.id}): {e}"
+				_logger.exception(error_msg)
+				sync_errors.append(error_msg)
+			except json.JSONDecodeError as e:
+				failed += 1
+				error_msg = f"JSON error processing response for template '{template.name}' (Odoo ID: {template.id}): {e}. Response: {response.text if response else 'No response'}"
+				_logger.exception(error_msg)
+				sync_errors.append(error_msg)
 			except Exception as e:
 				failed += 1
-				_logger.exception(f"Error syncing product {product.name} to Shopify: {str(e)}")
+				error_msg = f"Unexpected error syncing template '{template.name}' (Odoo ID: {template.id}): {e}"
+				_logger.exception(error_msg)
+				sync_errors.append(error_msg)
 				
-		# Update last sync timestamp
-		self.env['ir.config_parameter'].sudo().set_param('shopify.last_export_time', fields.Datetime.now())
+		# Update last sync timestamp only if the batch had no failures (or decide based on policy)
+		# For robustness, update timestamp even with failures to avoid retrying the same failed items indefinitely in simple cron setup.
+		# If a more robust queue system is used, only update on full success.
+		self.env['ir.config_parameter'].sudo().set_param('shopify.last_export_time', sync_start_time)
+		_logger.info(f"Updated last export time to {sync_start_time}")
 		
-		_logger.info(f"Sync to Shopify completed: {created} created, {updated} updated, {failed} failed.")
-		return {
-			"status": "success",
-			"created": created,
-			"updated": updated,
-			"failed": failed
-		}
+		summary_message = f"Sync to Shopify completed: {created} created, {updated} updated, {failed} failed."
+		_logger.info(summary_message)
+		if sync_errors:
+			_logger.error("Errors encountered during sync:\n" + "\n".join(sync_errors))
+			return {
+				"status": "error" if failed > 0 else "success", # Consider partial success?
+				"message": summary_message + "\nErrors:\n" + "\n".join(sync_errors),
+				"created": created,
+				"updated": updated,
+				"failed": failed
+			}
+		else:
+			return {
+				"status": "success",
+				"message": summary_message,
+				"created": created,
+				"updated": updated,
+				"failed": failed
+			}
 	
-	def _prepare_shopify_product_data(self, product):
+	def _prepare_shopify_product_data(self, template):
 		"""
-		Prepare Odoo product data for Shopify API
-		
-		Args:
-			product: Odoo product.product record
-		
-		Returns:
-			dict: Formatted product data for Shopify
-		"""
-		# Get product status from system parameters
-		shopify_product_status = self.env['ir.config_parameter'].sudo().get_param('shopify.product_status', 'draft')
-		
-		# Determine if the product should be published
-		is_published = shopify_product_status == 'active'
+		Prepare Odoo product template data (including variants) for the Shopify API.
 
-		# Convert image to base64 if present
-		image_data = None
-		if product.image_1920:
-			image_data = product.image_1920.decode('utf-8') if isinstance(product.image_1920, bytes) else product.image_1920
-		
-		# Prepare variant data
-		variant = {
-			"price": str(product.list_price),
-			"sku": product.default_code or "",
-			"inventory_management": "shopify",
-			"inventory_quantity": self._get_product_stock_quantity(product),
-			"requires_shipping": True
-		}
-		
-		# Prepare product data
+		Args:
+			template (product.template): The Odoo product template record.
+
+		Returns:
+			dict or None: Formatted product data for Shopify, or None if no active variants.
+		"""
+		shopify_product_status = self.env['ir.config_parameter'].sudo().get_param('shopify.product_status', 'draft')
+		# is_published = shopify_product_status == 'active' # 'status' field handles this now
+
+		# --- Prepare Variants ---
+		shopify_variants_data = []
+		active_odoo_variants = template.product_variant_ids.filtered(lambda v: v.active)
+
+		if not active_odoo_variants:
+			_logger.warning(f"Template '{template.name}' (ID: {template.id}) has no active variants. Skipping.")
+			return None # Cannot sync a product with no variants
+
+		for variant in active_odoo_variants:
+			# Use a fallback SKU if default_code is empty, essential for matching later
+			variant_sku = variant.default_code or f"odoo-{template.id}-{variant.id}"
+			# --- Minimal Variant Data for Debugging ---
+			variant_data = {
+				# "price": str(variant.list_price),
+				"sku": variant_sku, # Keep SKU for matching
+				# "inventory_management": "shopify",
+				# "inventory_quantity": self._get_product_stock_quantity(variant),
+				# "requires_shipping": True,
+				# "barcode": variant.barcode or "",
+				# "weight": variant.weight,
+				# "weight_unit": "kg",
+			}
+			# If updating, include the Shopify variant ID for matching
+			if variant.shopify_variant_id and variant.shopify_variant_id.isdigit():
+				variant_data["id"] = int(variant.shopify_variant_id)
+
+			# --- Commented out Option Values ---
+			# option_values = variant.product_template_attribute_value_ids.mapped('name')
+			# if len(option_values) > 0: variant_data['option1'] = option_values[0]
+			# if len(option_values) > 1: variant_data['option2'] = option_values[1]
+			# if len(option_values) > 2: variant_data['option3'] = option_values[2]
+
+			shopify_variants_data.append(variant_data)
+
+		# --- Prepare Main Product Data ---
+		# --- Minimal Product Data for Debugging ---
 		product_data = {
-			"title": product.name,
-			"body_html": product.description_sale or "",
-			"vendor": product.company_id.name if product.company_id else "",
-			"product_type": product.categ_id.name if product.categ_id else "",
-			"published": is_published,
-			"status": shopify_product_status,
-			"variants": [variant]
+			"title": template.name, # Keep Title
+			# "body_html": template.description_sale or template.name,
+			# "vendor": template.company_id.name if template.company_id else "Odoo",
+			# "product_type": template.categ_id.name if template.categ_id else "Uncategorized",
+			# "status": shopify_product_status,
+			# "tags": ", ".join(template.tag_ids.mapped('name')),
+			"variants": shopify_variants_data, # Keep variants array, even if minimal
 		}
-		
-		# Add image if available
-		if image_data:
-			product_data["images"] = [{
-				"attachment": image_data
-			}]
-			
+
+		# --- Commented out Options ---
+		# options = []
+		# for attr_line in template.attribute_line_ids[:3]:
+		# 	options.append({
+		# 		"name": attr_line.attribute_id.name,
+		# 		"values": list(attr_line.value_ids.mapped('name'))
+		# 	})
+		# if options:
+		# 	product_data["options"] = options
+		# --- Commented out Images ---
+		# images_data = []
+		# if template.image_1920:
+		# 	try:
+		# 		img_b64 = template.image_1920 if isinstance(template.image_1920, str) else base64.b64encode(template.image_1920).decode('utf-8')
+		# 		images_data.append({"attachment": img_b64})
+		# 	except Exception as e:
+		# 		_logger.error(f"Could not encode image for template {template.name}: {e}")
+		#
+		# if images_data:
+		# 	product_data["images"] = images_data
+		# If updating, include the Shopify product ID in the main dict (required by Shopify PUT)
+		if template.shopify_product_id and template.shopify_product_id.isdigit():
+			product_data['id'] = int(template.shopify_product_id)
+
 		return product_data
 	
 	def _get_product_stock_quantity(self, product):
@@ -204,32 +289,87 @@ class OdooSync(models.Model):
 			('location_id.usage', '=', 'internal')
 		])
 		
-		return int(sum(quants.mapped('quantity')))
+		# Ensure quantity is non-negative
+		return max(0, int(sum(quants.mapped('quantity'))))
+
+	def _update_odoo_variant_ids(self, odoo_template, shopify_product_resp):
+		"""
+		Update Odoo product.product records with Shopify variant IDs based on SKU matching.
+
+		Args:
+			odoo_template (product.template): The Odoo template record.
+			shopify_product_resp (dict): The product data dictionary from Shopify API response.
+		"""
+		shopify_variants = shopify_product_resp.get('variants', [])
+		if not shopify_variants:
+			_logger.warning(f"No variants found in Shopify response for template '{odoo_template.name}' (Odoo ID: {odoo_template.id})")
+			return
+
+		_logger.info(f"Mapping {len(shopify_variants)} Shopify variants to Odoo variants for template '{odoo_template.name}'.")
+
+		# Create a map of Odoo variants by SKU (using the same fallback logic as _prepare_shopify_product_data)
+		odoo_variants_map = {}
+		for v in odoo_template.product_variant_ids:
+			sku = v.default_code or f"odoo-{odoo_template.id}-{v.id}"
+			odoo_variants_map[sku] = v
+
+		updated_count = 0
+		missing_sku_count = 0
+		for shopify_variant in shopify_variants:
+			shopify_variant_id = str(shopify_variant.get("id"))
+			sku = shopify_variant.get("sku")
+
+			if not sku:
+				_logger.warning(f"Shopify variant ID {shopify_variant_id} for template '{odoo_template.name}' is missing SKU in response. Cannot map.")
+				missing_sku_count += 1
+				continue
+
+			odoo_variant = odoo_variants_map.get(sku)
+
+			if odoo_variant:
+				# Check if ID needs updating or is missing
+				if odoo_variant.shopify_variant_id != shopify_variant_id:
+					try:
+						# Use sudo() if cron job runs as a restricted user
+						odoo_variant.sudo().write({"shopify_variant_id": shopify_variant_id})
+						updated_count += 1
+						_logger.debug(f"Mapped Shopify variant ID {shopify_variant_id} (SKU: {sku}) to Odoo variant ID {odoo_variant.id}.")
+					except Exception as e:
+						_logger.error(f"Failed to write Shopify Variant ID {shopify_variant_id} to Odoo variant {odoo_variant.id} (SKU: {sku}): {e}")
+						# Consider adding to sync_errors list?
+				# else: # No update needed
+				#     _logger.debug(f"Shopify variant ID {shopify_variant_id} (SKU: {sku}) already matches Odoo variant ID {odoo_variant.id}.")
+			else:
+				_logger.warning(f"Could not find matching Odoo variant for Shopify variant ID {shopify_variant_id} with SKU '{sku}' in template '{odoo_template.name}'. Was the variant deleted or SKU changed in Odoo without syncing?")
+
+		log_message = f"Finished mapping variants for template '{odoo_template.name}'. Updated: {updated_count}."
+		if missing_sku_count > 0:
+			log_message += f" Skipped {missing_sku_count} Shopify variants due to missing SKU in response."
+		_logger.info(log_message)
 
 class ProductProductShopify(models.Model):
 	_inherit = "product.product"
 
-	shopify_product_id = fields.Char("Shopify Product ID", index=True, help="ID of the product in Shopify")
+	shopify_product_id = fields.Char("Shopify Product ID", related='product_tmpl_id.shopify_product_id', store=False, readonly=True, help="Technical field: Shopify ID of the parent template.")
+	shopify_variant_id = fields.Char("Shopify Variant ID", index=True, copy=False, help="ID of this specific variant in Shopify")
 	
+	def sync_template_to_shopify(self):
+		"""Sync the parent template of this variant to Shopify"""
+		templates = self.mapped('product_tmpl_id')
+		if templates:
+			return self.env['odoo.sync'].sudo().sync_products_to_shopify(template_ids=templates.ids)
+		return False
+	
+	# Note: Automatic sync on create/write is disabled. Use the cron job or manual sync.
+	# If automatic sync is desired, uncomment and adapt the following methods
+	# to call sync_template_to_shopify() for the affected templates.
+
+# Add shopify_product_id to product.template
+class ProductTemplateShopify(models.Model):
+	_inherit = "product.template"
+
+	shopify_product_id = fields.Char("Shopify Product ID", index=True, copy=False, help="ID of the product in Shopify")
+
 	def sync_to_shopify(self):
-		"""Sync this product to Shopify (can be called from UI button)"""
-		self.ensure_one()
-		return self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=[self.id])
-	
-	# Remove or comment out these methods
-	# @api.model_create_multi
-	# def create(self, vals_list):
-	# 	"""Override create to sync new products to Shopify"""
-	# 	new_products = super(ProductProductShopify, self).create(vals_list)
-	# 	# Queue these products for Shopify sync
-	# 	self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=new_products.ids)
-	# 	return new_products
-	
-	# def write(self, vals):
-	# 	"""Override write to sync updated products to Shopify"""
-	# 	result = super(ProductProductShopify, self).write(vals)
-	# 	# Only sync if relevant fields changed
-	# 	relevant_fields = ['name', 'default_code', 'list_price', 'description_sale', 'image_1920', 'active']
-	# 	if any(field in vals for field in relevant_fields):
-	# 		self.env['odoo.sync'].sudo().sync_products_to_shopify(product_ids=self.ids)
-	# 	return result
+		"""Sync this product template to Shopify"""
+		return self.env['odoo.sync'].sudo().sync_products_to_shopify(template_ids=self.ids)
