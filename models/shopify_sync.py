@@ -283,8 +283,13 @@ class ShopifySync(models.Model):
                  _logger.warning(f"  'cost' field not found in inventory item data for ID {inventory_item_id}.")
 
 
+        except requests.exceptions.Timeout:
+            # Handle timeouts specifically
+            _logger.warning(f"Timeout fetching Shopify inventory item cost for ID {inventory_item_id}. Returning cost 0.0.")
+            # cost remains 0.0, will be returned at the end
         except requests.exceptions.RequestException as e:
-            _logger.error(f"Error fetching Shopify inventory item for ID {inventory_item_id}: {e}")
+            # Handle other request-related errors (connection, HTTP errors not caught by raise_for_status, etc.)
+            _logger.error(f"Error fetching Shopify inventory item cost for ID {inventory_item_id}: {e}. Returning cost 0.0.")
         except Exception as e:
              _logger.exception(f"Unexpected error processing Shopify inventory item for ID {inventory_item_id}: {e}")
 
