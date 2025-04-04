@@ -577,10 +577,28 @@ class ShopifySync(models.Model):
                              variant_domain.append(('product_template_attribute_value_ids', '=', ptav_id))
                          existing_variant = ProductModel.search(variant_domain, limit=1)
 
+                # Check for barcode conflicts before assigning
+                final_barcode_value = None # Default to no barcode
+                if barcode: # Only check if we have a barcode from Shopify
+                    ProductModel = self.env['product.product'] # Ensure ProductModel is defined here
+                    domain = [('barcode', '=', barcode)]
+                    if existing_variant:
+                        # Exclude the current variant if it already exists
+                        domain.append(('id', '!=', existing_variant.id))
+
+                    conflicting_product = ProductModel.search(domain, limit=1)
+
+                    if conflicting_product:
+                        _logger.warning(f"Barcode '{barcode}' from Shopify for SKU '{sku}' already exists on product '{conflicting_product.display_name}' (ID: {conflicting_product.id}). Skipping barcode assignment for this variant.")
+                        # final_barcode_value remains None
+                    else:
+                        # No conflict found, or the barcode belongs to the current variant
+                        final_barcode_value = barcode
+
                 variant_data = {
                     'product_tmpl_id': existing_template.id,
                     'default_code': sku,
-                    'barcode': barcode if barcode else None,
+                    'barcode': final_barcode_value, # Use the checked value
                     'standard_price': actual_cost, # Use cost fetched from InventoryItem
                     'weight': _convert_weight_to_kg(variant_weight_value, variant_weight_unit), # Use conversion helper
                     'active': True,
