@@ -5,9 +5,7 @@
         <field name="model">shopify.sync</field>
         <field name="arch" type="xml">
             <tree>
-                <field name="name"/>
-                <field name="sync_status"/>
-                <field name="sync_date"/>
+                <!-- Fields removed as they do not exist on the shopify.sync model -->
             </tree>
         </field>
     </record>
@@ -19,9 +17,7 @@
             <form string="Shopify Sync">
                 <sheet>
                     <group>
-                        <field name="name" readonly="1"/>
-                        <field name="sync_status" readonly="1"/>
-                        <field name="sync_date" readonly="1"/>
+                        <!-- Fields removed as they do not exist on the shopify.sync model -->
                     </group>
                 </sheet>
             </form>

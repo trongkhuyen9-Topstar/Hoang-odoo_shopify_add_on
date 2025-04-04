@@ -303,7 +303,7 @@ class ShopifySync(models.Model):
         return self.sync_products_to_odoo()
 
     @api.model
-    def fetch_shopify_products(self, last_sync_time=None, batch_size=10):
+    def fetch_shopify_products(self, last_sync_time=None, batch_size=5):
         """
         Fetch Shopify products with pagination, sorted by `updated_at` ascending
 
@@ -373,7 +373,7 @@ class ShopifySync(models.Model):
         return all_products
 
     @api.model
-    def sync_products_to_odoo(self, batch_size=10):
+    def sync_products_to_odoo(self, batch_size=5):
         """
         Sync Shopify products & inventory to Odoo
         """
