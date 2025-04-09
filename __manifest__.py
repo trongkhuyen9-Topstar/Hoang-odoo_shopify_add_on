@@ -6,7 +6,7 @@
   'depends': ['base', 'product', 'stock', 'sale'], # Added 'sale' dependency
   'installable': True, # Should be installable
   'application': True,
-  'category': 'Inventory/Connector', # Updated category
+  'category': 'Technical/Connector', # Updated category
   'license': 'LGPL-3',
   'maintainer': 'Franco',
   'description': """

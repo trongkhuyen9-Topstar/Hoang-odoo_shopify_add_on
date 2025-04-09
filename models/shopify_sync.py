@@ -233,68 +233,86 @@ class ShopifySync(models.Model):
 
 
     @api.model
-    def _fetch_shopify_inventory_item_cost(self, inventory_item_id):
+    def _fetch_shopify_inventory_item_costs_batch(self, inventory_item_ids):
         """
-        Fetches the cost associated with a specific inventory_item_id from Shopify.
+        Fetches costs for a list of inventory_item_ids from Shopify using a batch request.
 
         Args:
-            inventory_item_id (str | int): The Shopify inventory item ID.
+            inventory_item_ids (list[str | int]): A list of Shopify inventory item IDs.
 
         Returns:
-            float: The cost value, or 0.0 if not found or on error.
+            dict: A dictionary mapping inventory_item_id (str) to its cost (float).
+                  Returns an empty dict if no IDs are provided or on error.
         """
-        if not inventory_item_id:
-            _logger.warning("Cannot fetch inventory item cost without an inventory_item_id.")
-            return 0.0
+        if not inventory_item_ids:
+            _logger.warning("Cannot fetch inventory item costs without inventory_item_ids.")
+            return {}
+
+        # Ensure all IDs are strings and filter out any None/empty values
+        item_ids_str_list = [str(item_id) for item_id in inventory_item_ids if item_id]
+        if not item_ids_str_list:
+             _logger.warning("No valid inventory_item_ids provided after filtering for cost fetching.")
+             return {}
 
         shopify_access_token = self.env['ir.config_parameter'].sudo().get_param('shopify.access_token')
         shopify_store_url = self.env['ir.config_parameter'].sudo().get_param('shopify.store_url')
 
         if not shopify_access_token or not shopify_store_url:
             _logger.error("Missing Shopify credentials for inventory item cost fetching.")
-            return 0.0
+            return {}
 
-        item_url = f"https://{shopify_store_url}/admin/api/2023-01/inventory_items/{inventory_item_id}.json"
-        headers = {"X-Shopify-Access-Token": shopify_access_token}
+        costs_by_item_id = {}
+        # Shopify typically limits 'ids' parameter to 100 or 250. Let's use 100 to be safe.
+        batch_size = 100
+        for i in range(0, len(item_ids_str_list), batch_size):
+            batch_ids = item_ids_str_list[i:i + batch_size]
+            item_ids_param = ",".join(batch_ids)
+            item_url = f"https://{shopify_store_url}/admin/api/2023-01/inventory_items.json"
+            headers = {"X-Shopify-Access-Token": shopify_access_token}
+            params = {"ids": item_ids_param, "limit": batch_size} # Use limit matching batch size
 
-        cost = 0.0
-        try:
-            _logger.info(f"Fetching inventory item data for cost - Item ID: {inventory_item_id}")
-            response = requests.get(item_url, headers=headers, timeout=15)
+            try:
+                _logger.info(f"Fetching batch of inventory item costs ({len(batch_ids)} IDs): {item_ids_param[:200]}...")
+                response = requests.get(item_url, headers=headers, params=params, timeout=30) # Increased timeout
 
-            if response.status_code == 429:
-                 retry_after = int(response.headers.get('Retry-After', 10))
-                 _logger.warning(f"Rate limit hit fetching inventory item {inventory_item_id}, waiting {retry_after} seconds")
-                 time.sleep(retry_after)
-                 return self._fetch_shopify_inventory_item_cost(inventory_item_id) # Retry
+                if response.status_code == 429:
+                     retry_after = int(response.headers.get('Retry-After', 10))
+                     _logger.warning(f"Rate limit hit fetching inventory item costs batch, waiting {retry_after} seconds")
+                     time.sleep(retry_after)
+                     # Retry the same batch by recursively calling (or could implement iterative retry)
+                     # Note: This recursive call needs careful handling in case of persistent errors
+                     batch_costs = self._fetch_shopify_inventory_item_costs_batch(batch_ids)
+                     costs_by_item_id.update(batch_costs)
+                     continue # Move to the next batch after successful retry
 
-            response.raise_for_status() # Raise HTTPError for other bad responses
+                response.raise_for_status() # Raise HTTPError for other bad responses
 
-            data = response.json()
-            inventory_item = data.get("inventory_item", {})
-            cost_str = inventory_item.get("cost") # Cost is usually a string here
-            if cost_str is not None:
-                try:
-                    cost = float(cost_str)
-                    _logger.info(f"  Found cost '{cost_str}' for item ID {inventory_item_id}")
-                except (ValueError, TypeError):
-                     _logger.warning(f"  Could not convert cost '{cost_str}' to float for item ID {inventory_item_id}.")
-            else:
-                 _logger.warning(f"  'cost' field not found in inventory item data for ID {inventory_item_id}.")
+                data = response.json()
+                inventory_items = data.get("inventory_items", [])
+                _logger.info(f"  Received {len(inventory_items)} inventory items in cost batch response.")
 
+                for item in inventory_items:
+                    item_id_str = str(item.get("id"))
+                    cost_str = item.get("cost")
+                    cost = 0.0
+                    if cost_str is not None:
+                        try:
+                            cost = float(cost_str)
+                        except (ValueError, TypeError):
+                             _logger.warning(f"  Could not convert cost '{cost_str}' to float for item ID {item_id_str} in batch.")
+                    else:
+                        _logger.debug(f"  'cost' field not found for item ID {item_id_str} in batch.") # Debug level might be better
+                    costs_by_item_id[item_id_str] = cost
 
-        except requests.exceptions.Timeout:
-            # Handle timeouts specifically
-            _logger.warning(f"Timeout fetching Shopify inventory item cost for ID {inventory_item_id}. Returning cost 0.0.")
-            # cost remains 0.0, will be returned at the end
-        except requests.exceptions.RequestException as e:
-            # Handle other request-related errors (connection, HTTP errors not caught by raise_for_status, etc.)
-            _logger.error(f"Error fetching Shopify inventory item cost for ID {inventory_item_id}: {e}. Returning cost 0.0.")
-        except Exception as e:
-             _logger.exception(f"Unexpected error processing Shopify inventory item for ID {inventory_item_id}: {e}")
+            except requests.exceptions.Timeout:
+                _logger.warning(f"Timeout fetching Shopify inventory item costs batch starting with ID {batch_ids[0]}. Skipping batch.")
+            except requests.exceptions.RequestException as e:
+                _logger.error(f"Error fetching Shopify inventory item costs batch starting with ID {batch_ids[0]}: {e}. Skipping batch.")
+            except Exception as e:
+                 _logger.exception(f"Unexpected error processing Shopify inventory item costs batch starting with ID {batch_ids[0]}: {e}")
 
-        return cost
-
+        _logger.info(f"Finished fetching costs for {len(costs_by_item_id)} / {len(item_ids_str_list)} requested item IDs.")
+        return costs_by_item_id
 
     @api.model
     def _auto_sync_products(self):
@@ -303,7 +321,7 @@ class ShopifySync(models.Model):
         return self.sync_products_to_odoo()
 
     @api.model
-    def fetch_shopify_products(self, last_sync_time=None, batch_size=5):
+    def fetch_shopify_products(self, last_sync_time=None, batch_size=10):
         """
         Fetch Shopify products with pagination, sorted by `updated_at` ascending
 
@@ -324,7 +342,7 @@ class ShopifySync(models.Model):
         params = {
             "limit": batch_size,
             "order": "updated_at asc",
-            "status": "active" # Fetch only active products
+            # "status": "active" # Fetch only active products
         }
 
         if last_sync_time:
@@ -373,13 +391,16 @@ class ShopifySync(models.Model):
         return all_products
 
     @api.model
-    def sync_products_to_odoo(self, batch_size=5):
+    def sync_products_to_odoo(self):
         """
-        Sync Shopify products & inventory to Odoo
+        Sync Shopify products & inventory to Odoo.
+        Fetches all products since last sync time using pagination.
         """
-        _logger.info(f"Starting Shopify product sync (batch size: {batch_size})...")
-        last_sync_time = self.env['ir.config_parameter'].sudo().get_param('shopify.last_sync_time')
-        current_sync_time = datetime.now().isoformat()
+        ConfigParam = self.env['ir.config_parameter'].sudo()
+        batch_size = int(ConfigParam.get_param('shopify.sync.product_batch_size', 50)) # Read here for logging
+        _logger.info(f"Starting Shopify product sync (API fetch batch size: {batch_size})...")
+        last_sync_time = ConfigParam.get_param('shopify.last_sync_time')
+        # We'll set the new sync time at the very end based on the latest product processed
 
         # --- Get Location Mapping ---
         location_mapping = self._get_odoo_shopify_location_mapping()
@@ -387,7 +408,7 @@ class ShopifySync(models.Model):
              _logger.warning("Could not obtain Shopify location mapping. Inventory sync will be skipped for this run.")
         # --- End Location Mapping ---
 
-        shopify_products = self.fetch_shopify_products(last_sync_time, batch_size)
+        shopify_products = self.fetch_shopify_products(last_sync_time) # batch_size is now handled inside fetch_shopify_products
 
         if len(shopify_products) > 0:
             pass
@@ -400,9 +421,11 @@ class ShopifySync(models.Model):
         TaxModel = self.env['account.tax']
         LocationModel = self.env['stock.location']
         ProductTmplAttrValueModel = self.env['product.template.attribute.value']
+        # ConfigParam is already defined above
+        variant_processing_batch_size = int(ConfigParam.get_param('shopify.sync.variant_processing_batch_size', 15)) # Default 15
 
         updated_templates, created_templates, skipped_variants = 0, 0, 0
-        last_processed_product_update_time = None # Initialize before the loop
+        latest_update_time_processed = None # Track the latest timestamp processed successfully
 
         for product in shopify_products:
             shopify_product_id = str(product["id"])
@@ -486,8 +509,58 @@ class ShopifySync(models.Model):
                 _logger.info(f"Fetched inventory levels for {len(inventory_levels_by_item_id)} item IDs.")
             # --- End Batch Inventory Fetch ---
 
+            # --- Batch Cost Fetch (already done above) ---
+            # costs_by_item_id is available here
 
-            for variant in product.get("variants", []):
+            # --- Prepare for Variant Processing ---
+            all_variants = product.get("variants", [])
+            shopify_images = {img['id']: img['src'] for img in product.get('images', [])}
+            _logger.debug(f"Shopify Images Map for product {shopify_product_id}: {shopify_images}")
+            processed_variant_ids_for_product = set() # Track processed variants for this product
+            # Accumulate attribute/price commands across batches for this product
+            accumulated_attr_line_cmds = []
+            accumulated_price_extra_cmds = {} # Maps shopify_variant_id -> {value_id: price_extra}
+
+            # --- Batch Inventory Fetch --- # Moved slightly earlier for clarity
+            all_variant_inventory_item_ids = [
+                v.get("inventory_item_id") for v in all_variants if v.get("inventory_item_id")
+            ]
+            _logger.info(f"Found {len(all_variant_inventory_item_ids)} inventory item IDs for product {shopify_product_id}.")
+            inventory_levels_by_item_id = {}
+            if all_variant_inventory_item_ids:
+                inventory_levels_by_item_id = self._fetch_shopify_inventory_levels(all_variant_inventory_item_ids)
+                _logger.info(f"Fetched inventory levels for {len(inventory_levels_by_item_id)} item IDs.")
+            # --- End Batch Inventory Fetch ---
+
+            # --- Batch Cost Fetch ---
+            all_variant_inventory_item_ids_for_cost = [
+                v.get("inventory_item_id") for v in all_variants if v.get("inventory_item_id")
+            ]
+            costs_by_item_id = {}
+            if all_variant_inventory_item_ids_for_cost:
+                 _logger.info(f"Fetching costs for {len(all_variant_inventory_item_ids_for_cost)} inventory item IDs for product {shopify_product_id}.")
+                 costs_by_item_id = self._fetch_shopify_inventory_item_costs_batch(all_variant_inventory_item_ids_for_cost)
+                 _logger.info(f"Fetched costs for {len(costs_by_item_id)} item IDs.")
+            else:
+                 _logger.info(f"No inventory item IDs found for product {shopify_product_id} to fetch costs.")
+            # --- End Batch Cost Fetch ---
+            # --- Variant Batch Processing Loop ---
+            _logger.info(f"Processing {len(all_variants)} variants for product {shopify_product_id} in batches of {variant_processing_batch_size}...")
+            for i in range(0, len(all_variants), variant_processing_batch_size):
+                variant_batch = all_variants[i:i + variant_processing_batch_size]
+                _logger.info(f"  Processing variant batch {i // variant_processing_batch_size + 1} ({len(variant_batch)} variants)")
+
+                for variant in variant_batch:
+                    # Existing variant processing logic starts here...
+                    shopify_variant_id = str(variant["id"])
+                    sku = variant.get("sku", "")
+                    barcode = variant.get("barcode", "")
+                    variant_price = float(variant.get("price", 0.0))
+                    variant_weight_value = float(variant.get("weight", 0.0)) # Store original value
+                    variant_weight_unit = variant.get("weight_unit", "kg") # Get unit, default kg
+                    inventory_quantity = variant.get("inventory_quantity", 0) # Note: Likely total, use inventory levels API
+                    inventory_item_id = variant.get("inventory_item_id") # Fetch inventory item ID here
+                    variant_image_id = variant.get("image_id")
                 shopify_variant_id = str(variant["id"])
                 sku = variant.get("sku", "")
                 barcode = variant.get("barcode", "")
@@ -499,22 +572,14 @@ class ShopifySync(models.Model):
                 inventory_item_id = variant.get("inventory_item_id") # Fetch inventory item ID here
                 variant_image_id = variant.get("image_id")
 
-                # --- Determine Cost ---
+                # --- Determine Cost (using pre-fetched batch data) ---
                 actual_cost = 0.0
-                variant_cost_raw = variant.get("cost") # Check variant data first
-                if variant_cost_raw is not None:
-                    try:
-                        actual_cost = float(variant_cost_raw)
-                        _logger.info(f"  Using cost '{actual_cost}' directly from variant data for SKU {sku}.")
-                    except (ValueError, TypeError):
-                         _logger.warning(f"  Could not convert cost '{variant_cost_raw}' from variant data for SKU {sku}. Will try fetching from InventoryItem.")
-                         actual_cost = self._fetch_shopify_inventory_item_cost(inventory_item_id)
+                if inventory_item_id:
+                    actual_cost = costs_by_item_id.get(str(inventory_item_id), 0.0)
+                    _logger.info(f"  Retrieved cost {actual_cost} from pre-fetched batch data for Item ID {inventory_item_id} (SKU: {sku}).")
                 else:
-                     _logger.info(f"  Cost not found directly on variant data for SKU {sku}. Fetching from InventoryItem ID {inventory_item_id}.")
-                     actual_cost = self._fetch_shopify_inventory_item_cost(inventory_item_id)
+                    _logger.warning(f"  Cannot determine cost for SKU {sku} as InventoryItem ID is missing.")
                 # --- End Determine Cost ---
-
-
                 if not sku and len(product.get("variants", [])) > 1:
                      _logger.warning(f"Skipping variant for product '{product['title']}' (Shopify ID: {shopify_product_id}) due to missing SKU in multi-variant product.")
                      skipped_variants += 1
@@ -550,24 +615,47 @@ class ShopifySync(models.Model):
                         current_variant_price_extra_cmds[attribute_value.id] = price_extra
                         _logger.info(f"  Attribute Value: {value_name} (ID: {attribute_value.id}), Calculated Price Extra: {price_extra}")
 
+                        # --- Accumulate Attribute Line Commands ---
+                        # Check if attribute needs to be added to template lines
                         if attribute.id not in current_attributes:
-                             if attribute.id not in [cmd[2]['attribute_id'] for cmd in product_attribute_lines_cmds if cmd[0] == 0]:
-                                 product_attribute_lines_cmds.append((0, 0, {
+                             # Check if already planned in accumulated commands for this product
+                             if attribute.id not in [cmd[2]['attribute_id'] for cmd in accumulated_attr_line_cmds if cmd[0] == 0]:
+                                 accumulated_attr_line_cmds.append((0, 0, {
                                      'attribute_id': attribute.id,
-                                     'value_ids': [(6, 0, [attribute_value.id])]
+                                     'value_ids': [(6, 0, [attribute_value.id])] # Start with this value
                                  }))
-                                 current_attributes.add(attribute.id)
+                                 current_attributes.add(attribute.id) # Mark as handled for this product
+                             else:
+                                 # Attribute is planned, ensure this value is added
+                                 for cmd in accumulated_attr_line_cmds:
+                                      if cmd[0] == 0 and cmd[2]['attribute_id'] == attribute.id:
+                                          if attribute_value.id not in cmd[2]['value_ids'][0][2]:
+                                               cmd[2]['value_ids'][0][2].append(attribute_value.id)
+                                          break
                         else:
+                             # Attribute exists on template, check if value needs to be added
                              existing_line = next((line for line in current_attribute_lines if line.attribute_id.id == attribute.id), None)
                              if existing_line and attribute_value.id not in existing_line.value_ids.ids:
-                                 product_attribute_lines_cmds.append((1, existing_line.id, {'value_ids': [(4, attribute_value.id)]}))
+                                  # Check if already planned in accumulated commands
+                                  planned_update = False
+                                  for cmd in accumulated_attr_line_cmds:
+                                      if cmd[0] == 1 and cmd[1] == existing_line.id:
+                                          if attribute_value.id not in cmd[2]['value_ids'][0][2]:
+                                               cmd[2]['value_ids'][0][2].append(attribute_value.id)
+                                          planned_update = True
+                                          break
+                                  if not planned_update:
+                                       # If not planned, add a command to update the existing line
+                                       # Use (6, 0, ...) to replace existing values + add the new one
+                                       all_value_ids = existing_line.value_ids.ids + [attribute_value.id]
+                                       accumulated_attr_line_cmds.append((1, existing_line.id, {'value_ids': [(6, 0, all_value_ids)] }))
 
-                variant_price_extra_cmds[shopify_variant_id] = current_variant_price_extra_cmds
+                        # --- Accumulate Price Extra Commands ---
+                        if shopify_variant_id not in accumulated_price_extra_cmds:
+                            accumulated_price_extra_cmds[shopify_variant_id] = {}
+                        accumulated_price_extra_cmds[shopify_variant_id][attribute_value.id] = price_extra
 
-                if product_attribute_lines_cmds:
-                    _logger.info(f"Updating attribute lines for template: {existing_template.name}")
-                    existing_template.write({'attribute_line_ids': product_attribute_lines_cmds})
-                    product_attribute_lines_cmds = []
+                # --- Variant Create/Update Logic (largely unchanged, uses 'existing_variant') ---
 
                 existing_variant = ProductModel.search([('default_code', '=', sku)], limit=1)
                 if not existing_variant and variant_attribute_value_ids:
@@ -639,7 +727,7 @@ class ShopifySync(models.Model):
                     existing_variant.sudo().write(variant_data)
                     # --- END sudo() ---
                     _logger.info(f"Updated variant: SKU {sku} for template {existing_template.name}")
-                    processed_variant_ids.add(existing_variant.id)
+                    processed_variant_ids_for_product.add(existing_variant.id)
                 else:
                     # Search again
                     ptav_domain = [
@@ -659,7 +747,7 @@ class ShopifySync(models.Model):
                          existing_variant.sudo().write(variant_data)
                          # --- END sudo() ---
                          _logger.info(f"Updated variant (found after template update): SKU {sku}")
-                         processed_variant_ids.add(existing_variant.id)
+                         processed_variant_ids_for_product.add(existing_variant.id)
                     else:
                          _logger.error(f"Could not find or create variant for SKU {sku} and template {existing_template.name}. Manual check needed.")
                          skipped_variants += 1
@@ -774,20 +862,103 @@ class ShopifySync(models.Model):
                 else:
                      _logger.warning("Location mapping not available. Inventory sync skipped for variant SKU {sku}.")
 
-            # Track the updated_at of the last successfully processed product (inside the loop)
-            if product.get('updated_at'):
-                 last_processed_product_update_time = product.get('updated_at')
-            # --- End of 'for product in shopify_products:' loop ---
-
-
-            # --- Optional: Deactivate Odoo variants not present in Shopify ---
+                 # --- End of Inner Variant Batch Loop (for variant in variant_batch) ---
+             # --- End of Outer Variant Batch Loop (for i in range...) ---
+ 
+             # --- Apply Accumulated Attribute Lines (after all batches for the product) ---
+            if accumulated_attr_line_cmds:
+                  _logger.info(f"Applying {len(accumulated_attr_line_cmds)} accumulated attribute line commands for template: {existing_template.name}")
+                  try:
+                      # Use sudo() if permissions require it
+                      existing_template.sudo().write({'attribute_line_ids': accumulated_attr_line_cmds})
+                      # Refresh template to get updated attribute lines for price extra setting
+                      existing_template.invalidate_cache(['attribute_line_ids'])
+                      existing_template.refresh()
+                      _logger.info(f"Successfully applied attribute lines for template {existing_template.name}")
+                  except Exception as e_attr:
+                       _logger.error(f"Error applying accumulated attribute lines for template {existing_template.name}: {e_attr}")
+ 
+             # --- Apply Accumulated Price Extra (after attributes are set) ---
+            _logger.info(f"Applying accumulated price extra commands for {len(accumulated_price_extra_cmds)} variants of product {existing_template.name}")
+            for shopify_variant_id, price_extra_cmds_for_variant in accumulated_price_extra_cmds.items():
+                  _logger.debug(f"  Processing price extra for Shopify Variant ID: {shopify_variant_id}")
+                  for value_id, price_extra_val in price_extra_cmds_for_variant.items():
+                      # Find the PTAV record *now* after attributes are potentially updated
+                      ptav_search_domain = [
+                          ('product_tmpl_id', '=', existing_template.id),
+                          ('product_attribute_value_id', '=', value_id)
+                      ]
+                      # Use sudo() if needed
+                      ptav_recs = ProductTmplAttrValueModel.sudo().search(ptav_search_domain)
+                      _logger.debug(f"    Searching for PTAV with domain: {ptav_search_domain} to set price_extra={price_extra_val}")
+                      if ptav_recs:
+                          _logger.info(f"    Found {len(ptav_recs)} PTAV records (IDs: {ptav_recs.ids}) for value ID {value_id}. Writing price_extra: {price_extra_val}")
+                          try:
+                              # Use sudo() if needed
+                              ptav_recs.sudo().write({'price_extra': price_extra_val})
+                          except Exception as e_price:
+                              _logger.error(f"    Error writing price_extra for value ID {value_id}: {e_price}")
+                      else:
+                          _logger.warning(f"    Could not find PTAV record for value ID {value_id} on template {existing_template.name} to set price_extra after batch processing.")
+ 
+             # --- Optional: Deactivate Odoo variants not present in this sync for this product ---
+             # This requires fetching all existing Odoo variants for the template first
+             # existing_odoo_variants = ProductModel.sudo().search([('product_tmpl_id', '=', existing_template.id)])
+             # variants_to_deactivate = existing_odoo_variants.filtered(lambda v: v.id not in processed_variant_ids_for_product)
+             # if variants_to_deactivate:
+             #    _logger.info(f"Deactivating {len(variants_to_deactivate)} Odoo variants for template {existing_template.name} not found in Shopify sync.")
+             #    variants_to_deactivate.sudo().write({'active': False})
+ 
+             # Track the latest update time processed successfully
+            product_update_time = product.get('updated_at')
+            if product_update_time:
+                  try:
+                      current_time_dt = parser.isoparse(product_update_time)
+                      if latest_update_time_processed is None or current_time_dt > latest_update_time_processed:
+                           latest_update_time_processed = current_time_dt
+                  except ValueError:
+                       _logger.warning(f"Could not parse 'updated_at' timestamp '{product_update_time}' for product {shopify_product_id}")
+ 
+             # Commit after each product is fully processed (including all its variant batches)
+             # Consider potential performance impact of committing frequently vs. risk of losing work on error
+            try:
+                self.env.cr.commit()
+                _logger.info(f"Committed transaction after processing product {shopify_product_id}")
+            except Exception as commit_e:
+                  _logger.error(f"Error committing transaction after product {shopify_product_id}: {commit_e}. Rolling back.")
+                  self.env.cr.rollback()
+                  # Decide if you want to stop the whole sync or continue with the next product
+                  # break # Example: Stop sync on commit error
+ 
+             # --- End of 'for product in shopify_products:' loop ---
 
         # Update last_sync_time based on the last processed product's timestamp
-        if shopify_products and last_processed_product_update_time:
-            # Use the updated_at timestamp of the last product in the processed batch
-            new_last_sync_time = last_processed_product_update_time
-            self.env['ir.config_parameter'].sudo().set_param('shopify.last_sync_time', new_last_sync_time)
-            _logger.info(f"Set last sync time (shopify.last_sync_time) to: {new_last_sync_time}")
+        # Update last_sync_time based on the latest 'updated_at' timestamp encountered across ALL processed products
+        # This requires tracking the maximum timestamp during the loop.
+        # Let's refine this logic. We should ideally store the timestamp of the *last successfully processed* product
+        # from the *current run* to ensure we don't miss updates if an error occurs mid-sync.
+        # For now, we'll update it based on the last product processed in the loop if successful.
+        # A more robust approach might involve storing progress per product.
+
+        latest_update_time_in_batch = None
+        if shopify_products:
+            # Find the latest 'updated_at' from the fetched products (assuming they are sorted ascending)
+            # Filter out products without 'updated_at' just in case
+            valid_update_times = [p.get('updated_at') for p in shopify_products if p.get('updated_at')]
+            if valid_update_times:
+                latest_update_time_in_batch = max(valid_update_times)
+
+        # Only update last_sync_time if the sync seemed successful and we have a new time
+        # We might need a more robust success check later
+        if latest_update_time_in_batch:
+             # Add a small buffer (e.g., 1 second) to avoid potential clock skew issues if needed,
+             # but using the exact time of the last processed item is usually fine.
+             # new_last_sync_time = (parser.isoparse(latest_update_time_in_batch) + timedelta(seconds=1)).isoformat()
+             new_last_sync_time = latest_update_time_in_batch
+             ConfigParam.set_param('shopify.last_sync_time', new_last_sync_time)
+             _logger.info(f"Set last sync time (shopify.last_sync_time) to: {new_last_sync_time}")
+        elif shopify_products:
+             _logger.warning("Processed products but could not determine the latest 'updated_at' timestamp. Last sync time not updated.")
         elif shopify_products:
              _logger.warning("Processed products but could not determine the 'updated_at' of the last one. Last sync time not updated.")
         else:
