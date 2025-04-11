@@ -374,6 +374,86 @@ class ShopifyOrderStatus(models.Model):
         return partner.id, billing_address_id, shipping_address_id
     # --- End Customer & Address Sync Helpers ---
 
+    @api.model
+    def _process_shopify_payments(self, invoice, shopify_transactions):
+        """
+        Creates Odoo account.payment records based on Shopify transactions
+        and reconciles them with the given invoice.
+        """
+        _logger.info(f"Processing payments for Invoice {invoice.name} (ID: {invoice.id})")
+        Payment = self.env['account.payment']
+        processed_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        # Find a suitable journal (e.g., the first Bank journal found)
+        # TODO: Make journal selection configurable (e.g., via system parameter or mapping)
+        journal = self.env['account.journal'].search([('type', '=', 'bank')], limit=1)
+        if not journal:
+            _logger.error(f"Invoice {invoice.name}: Cannot create payments. No Bank journal found.")
+            # Raise error to stop the process for this order? Or just log and skip payments?
+            # For now, log and skip.
+            return # Skip payment processing if no journal
+
+        for tx in shopify_transactions:
+            tx_id = str(tx.get('id'))
+            tx_kind = tx.get('kind')
+            tx_status = tx.get('status')
+            tx_amount = float(tx.get('amount', 0.0))
+            tx_currency = tx.get('currency')
+            tx_gateway = tx.get('gateway')
+            tx_created_at = tx.get('created_at')
+
+            _logger.debug(f"Invoice {invoice.name}: Evaluating TX ID {tx_id}, Kind: {tx_kind}, Status: {tx_status}, Amount: {tx_amount} {tx_currency}")
+
+            # Only process successful sales or captures
+            if tx_kind not in ['sale', 'capture'] or tx_status != 'success' or tx_amount <= 0:
+                _logger.debug(f"Invoice {invoice.name}: Skipping TX ID {tx_id} (Kind: {tx_kind}, Status: {tx_status}, Amount: {tx_amount})")
+                skipped_count += 1
+                continue
+
+            # Check if payment already exists for this transaction ID
+            existing_payment = Payment.search([('shopify_transaction_id', '=', tx_id)], limit=1)
+            if existing_payment:
+                _logger.info(f"Invoice {invoice.name}: Payment for TX ID {tx_id} already exists (Payment ID: {existing_payment.id}). Skipping.")
+                skipped_count += 1
+                continue
+
+            # Prepare payment values
+            payment_vals = {
+                'partner_id': invoice.partner_id.id,
+                'amount': tx_amount,
+                'payment_type': 'inbound',
+                'partner_type': 'customer',
+                'journal_id': journal.id,
+                'currency_id': invoice.currency_id.id, # Use invoice currency
+                'date': parser.parse(tx_created_at).date() if tx_created_at else fields.Date.context_today(self),
+                'ref': f"Shopify Order {invoice.ref or invoice.name} / TX {tx_id} ({tx_gateway or 'N/A'})", # Use invoice ref if available
+                'shopify_transaction_id': tx_id,
+                # Link to the invoice for reconciliation
+                'reconciled_invoice_ids': [(6, 0, [invoice.id])],
+            }
+
+            # Validate currency match (important!)
+            if invoice.currency_id.name != tx_currency:
+                 _logger.warning(f"Invoice {invoice.name}: Currency mismatch between Invoice ({invoice.currency_id.name}) and Shopify TX {tx_id} ({tx_currency}). Skipping payment creation.")
+                 error_count += 1
+                 continue # Skip this transaction
+
+            try:
+                payment = Payment.create(payment_vals)
+                _logger.info(f"Invoice {invoice.name}: Created Payment {payment.name} (ID: {payment.id}) for TX ID {tx_id}")
+                # Post the payment to register it
+                payment.action_post()
+                _logger.info(f"Invoice {invoice.name}: Posted Payment {payment.name}")
+                processed_count += 1
+            except Exception as e:
+                _logger.error(f"Invoice {invoice.name}: Failed to create/post payment for TX ID {tx_id}: {e}")
+                error_count += 1
+                # Don't rollback here, let the main loop handle it if necessary
+
+        _logger.info(f"Invoice {invoice.name}: Payment processing finished. Processed: {processed_count}, Skipped: {skipped_count}, Errors: {error_count}")
+
 
     @api.model
     def sync_orders(self, batch_size=50): # Renamed method
@@ -407,7 +487,8 @@ class ShopifyOrderStatus(models.Model):
                 "line_items," # Includes variant_id, product_id, sku, quantity, price, total_discount, tax_lines, name, title
                 "shipping_lines," # Includes price, title, code
                 "discount_codes," # Includes code, amount, type
-                "note" # Customer note
+                "note," # Customer note
+                "transactions" # Added to fetch payment details
                 )
         }
 
@@ -557,19 +638,65 @@ class ShopifyOrderStatus(models.Model):
                     _logger.info(f"Created Odoo Sale Order {new_order.name} (ID: {new_order.id}) for Shopify Order {shopify_id}.")
                     odoo_order = new_order
                     total_so_created += 1
+                    odoo_order = new_order # Ensure odoo_order is assigned from new_order
 
-                # --- Update Sync Status Record with SO link and success message ---
-                success_msg = f"Successfully processed."
-                if line_errors:
-                    success_msg += f" Line errors: {'; '.join(line_errors)}"
-                sync_status_record.write({
-                    'odoo_order_id': odoo_order.id if odoo_order else False,
-                    'sync_message': success_msg
-                })
+                # --- 5. Create Invoice and Process Payments ---
+                invoice = None
+                if odoo_order: # Ensure we have a valid order object
+                    try:
+                        # Confirm the order if it's in draft state
+                        if odoo_order.state == 'draft':
+                            odoo_order.action_confirm()
+                            _logger.info(f"Confirmed Odoo Sale Order {odoo_order.name}")
+
+                        # Create Invoice(s) only if the order is confirmed ('sale') or done
+                        if odoo_order.state in ['sale', 'done']:
+                            invoices = odoo_order._create_invoices()
+                            if invoices:
+                                invoice = invoices[0] # Assume one invoice for simplicity for now
+                                _logger.info(f"Created Invoice {invoice.name} (ID: {invoice.id}) for Order {odoo_order.name}")
+                                # Optional: Post the invoice immediately if needed
+                                # invoice.action_post()
+
+                                # --- 6. Process Shopify Transactions ---
+                                shopify_transactions = order_data.get('transactions', [])
+                                if shopify_transactions:
+                                    _logger.info(f"Processing {len(shopify_transactions)} Shopify transactions for Order {odoo_order.name}")
+                                    # Call a new method to handle payment creation (to be implemented)
+                                    self._process_shopify_payments(invoice, shopify_transactions)
+                                else:
+                                    _logger.info(f"No Shopify transactions found for Order {odoo_order.name}")
+                            else:
+                                _logger.warning(f"No invoice created for Order {odoo_order.name}. Check invoicing policy or order status.")
+                        else:
+                             _logger.warning(f"Order {odoo_order.name} not in 'sale' or 'done' state ({odoo_order.state}). Skipping invoice creation.")
+
+                    except Exception as e_inv_pay:
+                        # Log the error and potentially re-raise to trigger the main rollback
+                        error_msg_inv = f"Error during invoice/payment creation for Order {odoo_order.name}: {e_inv_pay}"
+                        _logger.error(error_msg_inv)
+                        # Update status message before raising
+                        sync_status_record.write({'sync_message': error_msg_inv})
+                        raise UserError(f"Failed during invoice/payment processing: {e_inv_pay}")
+
+
+                # --- Update Sync Status Record with SO link and success/error message ---
+                # (Moved message update partially into the try/except blocks above for specific errors)
+                # Update with final success message only if no exceptions occurred in invoice/payment step
+                if 'e_inv_pay' not in locals(): # Check if invoice/payment error occurred
+                    success_msg = f"Successfully processed."
+                    if invoice:
+                        success_msg += f" Invoice {invoice.name} created."
+                    if line_errors:
+                        success_msg += f" Line errors: {'; '.join(line_errors)}"
+                    sync_status_record.write({
+                        'odoo_order_id': odoo_order.id if odoo_order else False,
+                        'sync_message': success_msg
+                    })
 
                 total_processed += 1
                 last_processed_order_update_time = order_data.get('updated_at')
-                self.env.cr.commit() # Commit after each successful order
+                self.env.cr.commit() # Commit after each successful order (including invoice/payment)
 
             except Exception as e:
                  total_errors += 1

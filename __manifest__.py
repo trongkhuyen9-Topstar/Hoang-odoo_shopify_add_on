@@ -1,9 +1,9 @@
 {
   'name': 'Shopify Odoo Connector', # More general name
-  'version': '1.3', # Incremented version for order sync feature
+  'version': '1.4', # Incremented version for payment sync feature
   'summary': 'Sync products, customers, and orders between Shopify and Odoo', # Updated summary
   'author': 'Franco',
-  'depends': ['base', 'product', 'stock', 'sale'], # Added 'sale' dependency
+  'depends': ['base', 'product', 'stock', 'sale', 'account'], # Added 'sale' & 'account' dependencies
   'installable': True, # Should be installable
   'application': True,
   'category': 'Technical/Connector', # Updated category
