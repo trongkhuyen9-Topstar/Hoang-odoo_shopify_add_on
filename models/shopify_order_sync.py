@@ -565,9 +565,9 @@ class ShopifyOrderStatus(models.Model):
         )
 
         # Log if the customer has no company
-        partner = self.env['res.partner'].browse(partner_id)
-        if partner and not partner.is_company and not partner.parent_id:
-            _logger.info(f"Customer '{partner.name}' (ID: {partner.id}) has no company set (individual contact).")
+        # partner = self.env['res.partner'].browse(partner_id)
+        # if partner and not partner.is_company and not partner.parent_id:
+        #     _logger.info(f"Customer '{partner.name}' (ID: {partner.id}) has no company set (individual contact).")
 
         if not orders_batch:
             _logger.info("No new orders found to sync in this run.")
@@ -616,6 +616,10 @@ class ShopifyOrderStatus(models.Model):
                 if not partner_id:
                     raise UserError("Failed to sync customer/address details.")
 
+                # Log if the customer has no company (moved here where partner_id is defined)
+                partner = self.env['res.partner'].browse(partner_id)
+                if partner and not partner.is_company and not partner.parent_id:
+                    _logger.info(f"Customer '{partner.name}' (ID: {partner.id}) has no company set (individual contact).")
 
                 # --- 2. Find or Create Sale Order ---
                 existing_order = SaleOrder.search([('shopify_order_id', '=', shopify_id)], limit=1)
