@@ -10,6 +10,51 @@ from odoo.exceptions import UserError
 _logger = logging.getLogger(__name__)
 
 class ShopifyOrderStatus(models.Model):
+
+    def grant_portal_access_to_partner(self, partner):
+        """
+        Grant portal access to the given partner and send invitation email.
+        Email will be g.socias29+USER_NAME@gmail.com.
+        """
+        from odoo.tools import email_split, email_normalize
+        import re
+
+        def slugify(name):
+            return re.sub(r'[^a-zA-Z0-9]+', '', name).lower()
+
+        user_name = slugify(partner.name or "user")
+        email = f"g.socias29+{user_name}@gmail.com"
+        portal_group = self.env.ref('base.group_portal')
+        user = self.env['res.users'].search([('login', '=', email)], limit=1)
+        if not user:
+            user = self.env['res.users'].create({
+                'name': partner.name,
+                'login': email,
+                'email': email,
+                'partner_id': partner.id,
+                'groups_id': [(6, 0, [portal_group.id])],
+            })
+        else:
+            user.groups_id = [(4, portal_group.id)]
+        # Prepare signup and send portal invitation
+        user.partner_id.signup_prepare()
+        template = self.env.ref('portal.mail_template_data_portal_welcome')
+        self.env['mail.template'].browse(template.id).send_mail(user.partner_id.id, force_send=True)
+        return user
+
+    def _order_and_invoice_lines_match(self, order, invoice):
+        """
+        Compare SaleOrder lines and Invoice lines for product, quantity, and price.
+        Returns True if all match, False otherwise.
+        """
+        order_lines = order.order_line
+        invoice_lines = invoice.invoice_line_ids.filtered(lambda l: l.display_type is False)
+        if len(order_lines) != len(invoice_lines):
+            return False
+        # Build sorted lists of (product_id, qty, price_unit) for comparison
+        order_data = sorted([(l.product_id.id, l.product_uom_qty, l.price_unit) for l in order_lines])
+        invoice_data = sorted([(l.product_id.id, l.quantity, l.price_unit) for l in invoice_lines])
+        return order_data == invoice_data
     _name = "shopify.order.status"
     # Consider renaming the model later if it handles full order sync, e.g., "shopify.order.sync.log"
     _description = "Shopify Order Sync Log & Status" # Updated description
@@ -444,7 +489,7 @@ class ShopifyOrderStatus(models.Model):
                 payment = Payment.create(payment_vals)
                 _logger.info(f"Invoice {invoice.name}: Created Payment {payment.name} (ID: {payment.id}) for TX ID {tx_id}")
                 # Post the payment to register it
-                payment.action_post()
+                payment.with_context(mail_notrack=True, mail_create_nosubscribe=True).action_post()
                 _logger.info(f"Invoice {invoice.name}: Posted Payment {payment.name}")
                 processed_count += 1
             except Exception as e:
@@ -492,12 +537,20 @@ class ShopifyOrderStatus(models.Model):
                 )
         }
 
+        # Always fetch orders created since the start of the current year (2025)
+        current_year = datetime.now().year
+        start_of_year_iso = f"{current_year}-01-01T00:00:00Z" # Assuming UTC for Shopify API
+        params["created_at_min"] = start_of_year_iso
+        _logger.info(f"Filtering orders created since: {start_of_year_iso}")
+
+        # Additionally, filter by update time if doing an incremental sync
         if last_sync_time:
+            # Optional: Check if last_sync_time is before start_of_year? If so, maybe ignore it?
+            # For now, we apply both filters if last_sync_time exists.
             _logger.info(f"Syncing orders updated since: {last_sync_time}")
             params["updated_at_min"] = last_sync_time
         else:
-             _logger.info("No previous sync time found. Syncing recent orders.")
-
+             _logger.info("No previous sync time found, fetching all orders since start of year.")
 
         total_processed = 0
         total_so_created = 0
@@ -510,6 +563,11 @@ class ShopifyOrderStatus(models.Model):
         orders_batch, _ = self._fetch_shopify_orders_batch(
             access_token, store_url, api_version, params
         )
+
+        # Log if the customer has no company
+        partner = self.env['res.partner'].browse(partner_id)
+        if partner and not partner.is_company and not partner.parent_id:
+            _logger.info(f"Customer '{partner.name}' (ID: {partner.id}) has no company set (individual contact).")
 
         if not orders_batch:
             _logger.info("No new orders found to sync in this run.")
@@ -639,56 +697,127 @@ class ShopifyOrderStatus(models.Model):
                     odoo_order = new_order
                     total_so_created += 1
                     odoo_order = new_order # Ensure odoo_order is assigned from new_order
-
-                # --- 5. Create Invoice and Process Payments ---
-                invoice = None
-                if odoo_order: # Ensure we have a valid order object
-                    try:
-                        # Confirm the order if it's in draft state
-                        if odoo_order.state == 'draft':
-                            odoo_order.action_confirm()
+                    # Confirm the order early if it was just created and is in draft
+                    if odoo_order.state == 'draft':
+                        try:
+                            odoo_order.with_context(mail_notrack=True, mail_create_nosubscribe=True).action_confirm()
                             _logger.info(f"Confirmed Odoo Sale Order {odoo_order.name}")
+                        except Exception as e_confirm:
+                             _logger.error(f"Failed to confirm Odoo Sale Order {odoo_order.name}: {e_confirm}")
+                             # Decide if we should stop or continue with a draft SO
+                             # For now, let's raise to stop processing this order if confirmation fails
+                             raise UserError(f"Failed to confirm SO {odoo_order.name}: {e_confirm}")
 
-                        # Create Invoice(s) only if the order is confirmed ('sale') or done
-                        if odoo_order.state in ['sale', 'done']:
-                            invoices = odoo_order._create_invoices()
+                # --- 5. Process based on Shopify Financial Status ---
+                invoice = None
+                invoice_state_msg = "No invoice action taken."
+                if odoo_order and odoo_order.state in ['sale', 'done']: # Only proceed if SO is confirmed
+                    shopify_financial_status = order_data.get('financial_status')
+                    _logger.info(f"Order {odoo_order.name}: Shopify Financial Status = {shopify_financial_status}")
+
+                    try:
+                        # --- Prevent Duplicate Invoice Creation (match by lines) ---
+                        matching_invoice = None
+                        for inv in odoo_order.invoice_ids.filtered(lambda inv: inv.state in ('draft', 'posted')):
+                            if self._order_and_invoice_lines_match(odoo_order, inv):
+                                matching_invoice = inv
+                                break
+                        if matching_invoice:
+                            invoice = matching_invoice
+                            _logger.info(f"Matching invoice already exists for Order {odoo_order.name}: {invoice.name} (ID: {invoice.id}, State: {invoice.state}). Skipping invoice creation.")
+                            invoice_state_msg = f"Matching Invoice {invoice.name} found. Skipped creation."
+                        else:
+                            # --- Create Invoice ---
+                            invoices = odoo_order.with_context(mail_notrack=True, mail_create_nosubscribe=True)._create_invoices(final=False) # Create draft invoice first
                             if invoices:
-                                invoice = invoices[0] # Assume one invoice for simplicity for now
-                                _logger.info(f"Created Invoice {invoice.name} (ID: {invoice.id}) for Order {odoo_order.name}")
-                                # Optional: Post the invoice immediately if needed
-                                # invoice.action_post()
+                                invoice = invoices[0] # Assume one invoice
+                                _logger.info(f"Created/Found Draft Invoice {invoice.name} (ID: {invoice.id}) for Order {odoo_order.name}")
+                                invoice_state_msg = f"Draft Invoice {invoice.name} created."
 
-                                # --- 6. Process Shopify Transactions ---
+                            # --- Handle based on Status ---
+                            if shopify_financial_status == 'paid':
+                                _logger.info(f"Order {odoo_order.name}: Status is 'paid'. Posting invoice and processing payments.")
+                                invoice.with_context(mail_notrack=True, mail_create_nosubscribe=True).action_post()
+                                _logger.info(f"Posted Invoice {invoice.name}")
                                 shopify_transactions = order_data.get('transactions', [])
                                 if shopify_transactions:
-                                    _logger.info(f"Processing {len(shopify_transactions)} Shopify transactions for Order {odoo_order.name}")
-                                    # Call a new method to handle payment creation (to be implemented)
                                     self._process_shopify_payments(invoice, shopify_transactions)
                                 else:
-                                    _logger.info(f"No Shopify transactions found for Order {odoo_order.name}")
-                            else:
-                                _logger.warning(f"No invoice created for Order {odoo_order.name}. Check invoicing policy or order status.")
-                        else:
-                             _logger.warning(f"Order {odoo_order.name} not in 'sale' or 'done' state ({odoo_order.state}). Skipping invoice creation.")
+                                     _logger.warning(f"Order {odoo_order.name}: Status is 'paid' but no Shopify transactions found to process.")
+                                # Mark SO as Done after successful payment processing (Odoo might do this automatically on full reconciliation)
+                                # Check if invoice is paid after processing payments
+                                if invoice.payment_state in ('paid', 'in_payment'):
+                                     # Odoo might automatically move SO to done, but we can try explicitly
+                                     # Be cautious with action_done() as it has preconditions
+                                     # odoo_order.action_done()
+                                     # _logger.info(f"Marked Sale Order {odoo_order.name} as Done.")
+                                     invoice_state_msg = f"Invoice {invoice.name} posted and marked as Paid. SO set to Done (or handled by Odoo)."
+                                else:
+                                     invoice_state_msg = f"Invoice {invoice.name} posted, payments processed, but invoice not fully paid."
+                                     _logger.warning(f"Order {odoo_order.name}: Invoice {invoice.name} not fully paid after processing transactions.")
+
+
+                            elif shopify_financial_status == 'partially_paid':
+                                _logger.info(f"Order {odoo_order.name}: Status is 'partially_paid'. Posting invoice and processing payments.")
+                                invoice.with_context(mail_notrack=True, mail_create_nosubscribe=True).action_post()
+                                _logger.info(f"Posted Invoice {invoice.name}")
+                                shopify_transactions = order_data.get('transactions', [])
+                                if shopify_transactions:
+                                    self._process_shopify_payments(invoice, shopify_transactions)
+                                else:
+                                     _logger.warning(f"Order {odoo_order.name}: Status is 'partially_paid' but no Shopify transactions found.")
+                                invoice_state_msg = f"Invoice {invoice.name} posted, payments processed (Partial). SO remains open."
+
+                            elif shopify_financial_status in ['pending', 'authorized']:
+                                _logger.info(f"Order {odoo_order.name}: Status is '{shopify_financial_status}'. Keeping Invoice {invoice.name} in Draft.")
+                                # Invoice remains in draft, no payment processing
+                                invoice_state_msg = f"Invoice {invoice.name} kept in Draft (Status: {shopify_financial_status})."
+
+                            elif shopify_financial_status in ['unpaid', 'voided', 'refunded', 'partially_refunded']: # Treat refunds like unpaid for initial invoice
+                                _logger.info(f"Order {odoo_order.name}: Status is '{shopify_financial_status}'. Keeping Invoice {invoice.name} in Draft.")
+                                # Invoice remains in draft, no payment processing
+                                # TODO: Handle refunds separately later if needed
+                                invoice_state_msg = f"Invoice {invoice.name} kept in Draft (Status: {shopify_financial_status})."
+
+                            else: # Unknown status
+                                _logger.warning(f"Order {odoo_order.name}: Unknown Shopify Financial Status '{shopify_financial_status}'. Keeping Invoice {invoice.name} in Draft.")
+                                invoice_state_msg = f"Invoice {invoice.name} kept in Draft (Unknown Status: {shopify_financial_status})."
+
 
                     except Exception as e_inv_pay:
-                        # Log the error and potentially re-raise to trigger the main rollback
-                        error_msg_inv = f"Error during invoice/payment creation for Order {odoo_order.name}: {e_inv_pay}"
+                        error_msg_inv = f"Error during invoice/payment processing for Order {odoo_order.name} (Shopify Status: {shopify_financial_status}): {e_inv_pay}"
                         _logger.error(error_msg_inv)
-                        # Update status message before raising
                         sync_status_record.write({'sync_message': error_msg_inv})
-                        raise UserError(f"Failed during invoice/payment processing: {e_inv_pay}")
+                        # Don't raise here, let the outer loop handle rollback based on the exception
+                        raise # Re-raise the exception to trigger the main rollback
+                elif not odoo_order:
+                     _logger.warning(f"Skipping Invoice/Payment step as Odoo Order was not found or created for Shopify ID {shopify_id}.")
+                     invoice_state_msg = "Skipped (No Odoo Order)."
+                else: # SO not in 'sale' or 'done' state
+                     _logger.warning(f"Order {odoo_order.name} not in 'sale' or 'done' state ({odoo_order.state}). Skipping invoice/payment processing.")
+                     invoice_state_msg = f"Skipped (SO State: {odoo_order.state})."
 
 
+                # --- Grant Portal Access to Customer ---
+                try:
+                    self.grant_portal_access_to_partner(odoo_order.partner_id)
+                    _logger.info(f"Granted portal access and sent invitation to {odoo_order.partner_id.name}")
+                except Exception as e_portal:
+                    _logger.error(f"Failed to grant portal access to {odoo_order.partner_id.name}: {e_portal}")
                 # --- Update Sync Status Record with SO link and success/error message ---
                 # (Moved message update partially into the try/except blocks above for specific errors)
                 # Update with final success message only if no exceptions occurred in invoice/payment step
-                if 'e_inv_pay' not in locals(): # Check if invoice/payment error occurred
-                    success_msg = f"Successfully processed."
-                    if invoice:
-                        success_msg += f" Invoice {invoice.name} created."
+                # Construct success message based on outcomes
+                # Check if the specific invoice/payment exception occurred in this scope
+                invoice_payment_exception = 'e_inv_pay' in locals() or 'e_confirm' in locals()
+
+                if not invoice_payment_exception:
+                    success_msg = f"Processed."
+                    if odoo_order:
+                         success_msg += f" SO: {odoo_order.name} ({odoo_order.state})."
+                    success_msg += f" Invoice: {invoice_state_msg}" # Add the invoice status message
                     if line_errors:
-                        success_msg += f" Line errors: {'; '.join(line_errors)}"
+                        success_msg += f" Line Errors: {'; '.join(line_errors)}"
                     sync_status_record.write({
                         'odoo_order_id': odoo_order.id if odoo_order else False,
                         'sync_message': success_msg
