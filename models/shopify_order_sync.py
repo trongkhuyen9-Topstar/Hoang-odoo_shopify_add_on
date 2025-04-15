@@ -519,7 +519,9 @@ class ShopifyOrderStatus(models.Model):
         params = {
             "limit": batch_size,
             "order": "updated_at desc",
-            "status": "any", # Fetch orders of any status
+            "status": "any", # Fetch orders of any status (Shopify API doesn't filter by combined financial/fulfillment status directly in one param)
+            "financial_status": "paid", # Filter by financial status
+            "fulfillment_status": "fulfilled", # Filter by fulfillment status
             # Fetch fields needed for customer, order, lines, addresses, taxes, shipping, discounts
             "fields": (
                 "id,order_number,name,email,created_at,updated_at,"
