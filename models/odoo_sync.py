@@ -244,7 +244,7 @@ class OdooSync(models.Model):
 			"vendor": template.company_id.name if template.company_id else "Odoo",
 			"product_type": template.categ_id.name if template.categ_id else "Uncategorized",
 			"status": shopify_product_status, # Use configured status (draft/active)
-			"tags": ", ".join(template.tag_ids.mapped('name')),
+			# "tags": ", ".join(template.tag_ids.mapped('name')), # Removed due to AttributeError: 'product.template' object has no attribute 'tag_ids'
 			"variants": shopify_variants_data,
 		}
 
