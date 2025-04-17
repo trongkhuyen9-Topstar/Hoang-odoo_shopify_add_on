@@ -214,59 +214,65 @@ class OdooSync(models.Model):
 			variant_sku = variant.default_code or f"odoo-{template.id}-{variant.id}"
 			# --- Minimal Variant Data for Debugging ---
 			variant_data = {
-				# "price": str(variant.list_price),
+				"price": str(variant.list_price),
 				"sku": variant_sku, # Keep SKU for matching
-				# "inventory_management": "shopify",
-				# "inventory_quantity": self._get_product_stock_quantity(variant),
-				# "requires_shipping": True,
-				# "barcode": variant.barcode or "",
-				# "weight": variant.weight,
-				# "weight_unit": "kg",
+				"inventory_management": "shopify", # Assuming Shopify manages inventory
+				"inventory_quantity": self._get_product_stock_quantity(variant),
+				"requires_shipping": True, # Assuming physical products
+				"barcode": variant.barcode or "",
+				"weight": variant.weight,
+				"weight_unit": "kg", # Assuming kg, adjust if needed
 			}
 			# If updating, include the Shopify variant ID for matching
 			if variant.shopify_variant_id and variant.shopify_variant_id.isdigit():
 				variant_data["id"] = int(variant.shopify_variant_id)
 
-			# --- Commented out Option Values ---
-			# option_values = variant.product_template_attribute_value_ids.mapped('name')
-			# if len(option_values) > 0: variant_data['option1'] = option_values[0]
-			# if len(option_values) > 1: variant_data['option2'] = option_values[1]
-			# if len(option_values) > 2: variant_data['option3'] = option_values[2]
+			# --- Add Option Values ---
+			option_values = variant.product_template_attribute_value_ids.mapped('name')
+			if len(option_values) > 0: variant_data['option1'] = option_values[0]
+			if len(option_values) > 1: variant_data['option2'] = option_values[1]
+			if len(option_values) > 2: variant_data['option3'] = option_values[2]
+			# Note: Shopify only supports up to 3 options.
 
 			shopify_variants_data.append(variant_data)
 
 		# --- Prepare Main Product Data ---
 		# --- Minimal Product Data for Debugging ---
 		product_data = {
-			"title": template.name, # Keep Title
-			# "body_html": template.description_sale or template.name,
-			# "vendor": template.company_id.name if template.company_id else "Odoo",
-			# "product_type": template.categ_id.name if template.categ_id else "Uncategorized",
-			# "status": shopify_product_status,
-			# "tags": ", ".join(template.tag_ids.mapped('name')),
-			"variants": shopify_variants_data, # Keep variants array, even if minimal
+			"title": template.name,
+			"body_html": template.description_sale or template.name,
+			"vendor": template.company_id.name if template.company_id else "Odoo",
+			"product_type": template.categ_id.name if template.categ_id else "Uncategorized",
+			"status": shopify_product_status, # Use configured status (draft/active)
+			"tags": ", ".join(template.tag_ids.mapped('name')),
+			"variants": shopify_variants_data,
 		}
 
-		# --- Commented out Options ---
-		# options = []
-		# for attr_line in template.attribute_line_ids[:3]:
-		# 	options.append({
-		# 		"name": attr_line.attribute_id.name,
-		# 		"values": list(attr_line.value_ids.mapped('name'))
-		# 	})
-		# if options:
-		# 	product_data["options"] = options
-		# --- Commented out Images ---
+		# --- Add Options ---
+		options = []
+		# Limit to first 3 attribute lines as Shopify supports max 3 options
+		for attr_line in template.attribute_line_ids[:3]:
+			options.append({
+				"name": attr_line.attribute_id.name,
+				"values": list(attr_line.value_ids.mapped('name'))
+			})
+		if options:
+			product_data["options"] = options
+
+		# --- Add Images (Optional, uncomment if needed) ---
 		# images_data = []
 		# if template.image_1920:
 		# 	try:
-		# 		img_b64 = template.image_1920 if isinstance(template.image_1920, str) else base64.b64encode(template.image_1920).decode('utf-8')
+		# 		# Ensure image data is bytes before encoding
+		# 		img_bytes = template.image_1920 if isinstance(template.image_1920, bytes) else base64.b64decode(template.image_1920)
+		# 		img_b64 = base64.b64encode(img_bytes).decode('utf-8')
 		# 		images_data.append({"attachment": img_b64})
 		# 	except Exception as e:
 		# 		_logger.error(f"Could not encode image for template {template.name}: {e}")
 		#
 		# if images_data:
 		# 	product_data["images"] = images_data
+
 		# If updating, include the Shopify product ID in the main dict (required by Shopify PUT)
 		if template.shopify_product_id and template.shopify_product_id.isdigit():
 			product_data['id'] = int(template.shopify_product_id)
