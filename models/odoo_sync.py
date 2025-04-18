@@ -124,10 +124,11 @@ class OdooSync(models.Model):
         
         if last_sync:
             domain = ['|',
-                    ('write_date', '>', last_sync),
-                    ('product_variant_ids.write_date', '>', last_sync)
-                    ('product_variant_ids.stock_move_ids.write_date', '>', last_sync)
-                    ] + domain
+                ('write_date', '>', last_sync),
+                '|',  # ← THIS IS CRUCIAL
+                ('product_variant_ids.write_date', '>', last_sync),
+                ('product_variant_ids.stock_move_ids.write_date', '>', last_sync)
+                ] + domain
         
         return TemplateModel.search(domain, limit=100)  # Increased limit from 1 to 100
 
