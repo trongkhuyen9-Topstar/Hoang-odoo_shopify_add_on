@@ -126,6 +126,7 @@ class OdooSync(models.Model):
             domain = ['|',
                     ('write_date', '>', last_sync),
                     ('product_variant_ids.write_date', '>', last_sync)
+                    ('product_variant_ids.stock_move_ids.write_date', '>', last_sync)
                     ] + domain
         
         return TemplateModel.search(domain, limit=100)  # Increased limit from 1 to 100
@@ -371,6 +372,11 @@ class OdooSync(models.Model):
         }
 
         for variant in template.product_variant_ids.filtered(lambda v: v.active):
+
+            _logger.info(f"Processing variant {variant.id} (SKU: {variant.default_code})")
+            _logger.info(f"Inventory Item ID: {variant.shopify_inventory_item_id}")
+            _logger.info(f"Stock in Odoo Location {odoo_loc_id}: {qty} units")
+
             if not variant.shopify_inventory_item_id or not variant.shopify_inventory_item_id.isdigit():
                 error_msg = f"Missing inventory item ID for variant {variant.default_code}"
                 _logger.warning(error_msg)
