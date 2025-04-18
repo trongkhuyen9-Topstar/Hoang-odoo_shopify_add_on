@@ -484,6 +484,8 @@ class ShopifySync(models.Model):
             #         template_data['taxes_id'] = [(6, 0, taxes)]
 
             if existing_template:
+                # Prevent changing the type of an existing product that might have transactions
+                template_data.pop('type', None)
                 existing_template.write(template_data)
                 _logger.info(f"Updated product template: {existing_template.name} (Shopify ID: {shopify_product_id})")
                 updated_templates += 1
@@ -498,512 +500,375 @@ class ShopifySync(models.Model):
             processed_variant_ids = set()
             variant_price_extra_cmds = {}
 
-            # --- Batch Inventory Fetch ---
-            all_variant_inventory_item_ids = [
-                v.get("inventory_item_id") for v in product.get("variants", []) if v.get("inventory_item_id")
-            ]
-            _logger.info(f"Found {len(all_variant_inventory_item_ids)} inventory item IDs for product {shopify_product_id}.")
-            inventory_levels_by_item_id = {}
-            if all_variant_inventory_item_ids:
-                inventory_levels_by_item_id = self._fetch_shopify_inventory_levels(all_variant_inventory_item_ids)
-                _logger.info(f"Fetched inventory levels for {len(inventory_levels_by_item_id)} item IDs.")
-            # --- End Batch Inventory Fetch ---
-
-            # --- Batch Cost Fetch (already done above) ---
-            # costs_by_item_id is available here
-
-            # --- Prepare for Variant Processing ---
+            # --- Batch Variant Processing ---
             all_variants = product.get("variants", [])
-            shopify_images = {img['id']: img['src'] for img in product.get('images', [])}
-            _logger.debug(f"Shopify Images Map for product {shopify_product_id}: {shopify_images}")
-            processed_variant_ids_for_product = set() # Track processed variants for this product
-            # Accumulate attribute/price commands across batches for this product
-            accumulated_attr_line_cmds = []
-            accumulated_price_extra_cmds = {} # Maps shopify_variant_id -> {value_id: price_extra}
+            _logger.info(f"Processing {len(all_variants)} variants for product {shopify_product_id} in batches of {variant_processing_batch_size}")
 
-            # --- Batch Inventory Fetch --- # Moved slightly earlier for clarity
-            all_variant_inventory_item_ids = [
-                v.get("inventory_item_id") for v in all_variants if v.get("inventory_item_id")
-            ]
-            _logger.info(f"Found {len(all_variant_inventory_item_ids)} inventory item IDs for product {shopify_product_id}.")
-            inventory_levels_by_item_id = {}
-            if all_variant_inventory_item_ids:
-                inventory_levels_by_item_id = self._fetch_shopify_inventory_levels(all_variant_inventory_item_ids)
-                _logger.info(f"Fetched inventory levels for {len(inventory_levels_by_item_id)} item IDs.")
-            # --- End Batch Inventory Fetch ---
+            # Fetch all inventory levels and costs for all variants of this product *before* processing batches
+            all_variant_ids = [str(v['id']) for v in all_variants if v.get('id')]
+            all_inventory_item_ids = [str(v['inventory_item_id']) for v in all_variants if v.get('inventory_item_id')]
 
-            # --- Batch Cost Fetch ---
-            all_variant_inventory_item_ids_for_cost = [
-                v.get("inventory_item_id") for v in all_variants if v.get("inventory_item_id")
-            ]
-            costs_by_item_id = {}
-            if all_variant_inventory_item_ids_for_cost:
-                 _logger.info(f"Fetching costs for {len(all_variant_inventory_item_ids_for_cost)} inventory item IDs for product {shopify_product_id}.")
-                 costs_by_item_id = self._fetch_shopify_inventory_item_costs_batch(all_variant_inventory_item_ids_for_cost)
-                 _logger.info(f"Fetched costs for {len(costs_by_item_id)} item IDs.")
-            else:
-                 _logger.info(f"No inventory item IDs found for product {shopify_product_id} to fetch costs.")
-            # --- End Batch Cost Fetch ---
-            # --- Variant Batch Processing Loop ---
-            _logger.info(f"Processing {len(all_variants)} variants for product {shopify_product_id} in batches of {variant_processing_batch_size}...")
+            _logger.info(f"Fetching inventory levels for {len(all_inventory_item_ids)} inventory item IDs...")
+            inventory_levels_by_item_id = self._fetch_shopify_inventory_levels(all_inventory_item_ids)
+            _logger.info(f"Fetching costs for {len(all_inventory_item_ids)} inventory item IDs...")
+            costs_by_item_id = self._fetch_shopify_inventory_item_costs_batch(all_inventory_item_ids)
+            _logger.info("Finished pre-fetching inventory levels and costs for all variants.")
+
+
             for i in range(0, len(all_variants), variant_processing_batch_size):
                 variant_batch = all_variants[i:i + variant_processing_batch_size]
-                _logger.info(f"  Processing variant batch {i // variant_processing_batch_size + 1} ({len(variant_batch)} variants)")
+                _logger.info(f"Processing variant batch {i // variant_processing_batch_size + 1}...")
 
+                # Prepare attribute lines and values within the batch
+                batch_attribute_values = {} # { 'Attribute Name': set('Value1', 'Value2') }
                 for variant in variant_batch:
-                    # Existing variant processing logic starts here...
-                    shopify_variant_id = str(variant["id"])
-                    sku = variant.get("sku", "")
-                    barcode = variant.get("barcode", "")
-                    variant_price = float(variant.get("price", 0.0))
-                    variant_weight_value = float(variant.get("weight", 0.0)) # Store original value
-                    variant_weight_unit = variant.get("weight_unit", "kg") # Get unit, default kg
-                    inventory_quantity = variant.get("inventory_quantity", 0) # Note: Likely total, use inventory levels API
-                    inventory_item_id = variant.get("inventory_item_id") # Fetch inventory item ID here
-                    variant_image_id = variant.get("image_id")
-                shopify_variant_id = str(variant["id"])
-                sku = variant.get("sku", "")
-                barcode = variant.get("barcode", "")
-                variant_price = float(variant.get("price", 0.0))
-                # variant_cost = float(variant.get("cost", 0.0)) # Cost is likely on InventoryItem
-                variant_weight_value = float(variant.get("weight", 0.0)) # Store original value
-                variant_weight_unit = variant.get("weight_unit", "kg") # Get unit, default kg
-                inventory_quantity = variant.get("inventory_quantity", 0) # Note: Likely total, use inventory levels API
-                inventory_item_id = variant.get("inventory_item_id") # Fetch inventory item ID here
-                variant_image_id = variant.get("image_id")
+                    for option_index, option in enumerate(variant.get("option_values", [])): # Use option_values if available
+                         option_name = (product.get("options", []) + [{}])[option_index].get("name") # Get corresponding option name
+                         if option_name:
+                             if option_name not in batch_attribute_values:
+                                 batch_attribute_values[option_name] = set()
+                             batch_attribute_values[option_name].add(option['value']) # Add the value
+                    # Fallback to option1, option2, option3 if option_values not present
+                    if not variant.get("option_values"):
+                        for option_num in range(1, 4):
+                            option_key = f"option{option_num}"
+                            option_value = variant.get(option_key)
+                            if option_value:
+                                # Try to get the actual attribute name from product['options']
+                                option_name = (product.get("options", []) + [{}, {}, {}])[option_num - 1].get("name")
+                                if option_name: # Use the real name if found
+                                    if option_name not in batch_attribute_values:
+                                        batch_attribute_values[option_name] = set()
+                                    batch_attribute_values[option_name].add(option_value)
+                                # else: # Fallback if name not in product['options'] (less likely)
+                                #     fallback_name = f"Option {option_num}"
+                                #     if fallback_name not in batch_attribute_values:
+                                #         batch_attribute_values[fallback_name] = set()
+                                #     batch_attribute_values[fallback_name].add(option_value)
 
-                # --- Determine Cost (using pre-fetched batch data) ---
-                actual_cost = 0.0
-                if inventory_item_id:
-                    actual_cost = costs_by_item_id.get(str(inventory_item_id), 0.0)
-                    _logger.info(f"  Retrieved cost {actual_cost} from pre-fetched batch data for Item ID {inventory_item_id} (SKU: {sku}).")
-                else:
-                    _logger.warning(f"  Cannot determine cost for SKU {sku} as InventoryItem ID is missing.")
-                # --- End Determine Cost ---
-                if not sku and len(product.get("variants", [])) > 1:
-                     _logger.warning(f"Skipping variant for product '{product['title']}' (Shopify ID: {shopify_product_id}) due to missing SKU in multi-variant product.")
-                     skipped_variants += 1
-                     continue
-                elif not sku:
-                     sku = f"{existing_template.name}-DEFAULT"
-                     _logger.info(f"Variant for product '{product['title']}' has no SKU. Using generated SKU: {sku}")
 
-                variant_attribute_value_ids = []
-                current_variant_price_extra_cmds = {}
+                # Ensure attributes and values exist in Odoo for this batch
+                current_template_attribute_lines = existing_template.attribute_line_ids.mapped('attribute_id.name')
+                new_attribute_line_cmds = []
 
-                current_attribute_lines = existing_template.attribute_line_ids
-                current_attributes = {line.attribute_id.id for line in current_attribute_lines}
-
-                for option in product.get("options", []):
-                    option_name = option["name"]
-                    attribute = AttributeModel.search([('name', '=', option_name)], limit=1)
+                for attr_name, value_set in batch_attribute_values.items():
+                    attribute = AttributeModel.search([('name', '=', attr_name)], limit=1)
                     if not attribute:
-                        attribute = AttributeModel.create({'name': option_name})
+                        attribute = AttributeModel.create({'name': attr_name})
+                        _logger.info(f"Created new product attribute: {attr_name}")
 
-                    value_name = variant.get(f"option{option['position']}")
-                    if value_name:
-                        attribute_value = AttributeValueModel.search([
-                            ('attribute_id', '=', attribute.id), ('name', '=', value_name)
-                        ], limit=1)
+                    value_ids = []
+                    for val_name in value_set:
+                        attribute_value = AttributeValueModel.search([('name', '=', val_name), ('attribute_id', '=', attribute.id)], limit=1)
                         if not attribute_value:
-                            attribute_value = AttributeValueModel.create({
-                                'attribute_id': attribute.id, 'name': value_name
-                            })
-                        variant_attribute_value_ids.append(attribute_value.id)
+                            attribute_value = AttributeValueModel.create({'name': val_name, 'attribute_id': attribute.id})
+                            _logger.info(f"Created new attribute value: {val_name} for attribute {attr_name}")
+                        value_ids.append(attribute_value.id)
 
-                        price_extra = variant_price - base_price
-                        current_variant_price_extra_cmds[attribute_value.id] = price_extra
-                        _logger.info(f"  Attribute Value: {value_name} (ID: {attribute_value.id}), Calculated Price Extra: {price_extra}")
-
-                        # --- Accumulate Attribute Line Commands ---
-                        # Check if attribute needs to be added to template lines
-                        if attribute.id not in current_attributes:
-                             # Check if already planned in accumulated commands for this product
-                             if attribute.id not in [cmd[2]['attribute_id'] for cmd in accumulated_attr_line_cmds if cmd[0] == 0]:
-                                 accumulated_attr_line_cmds.append((0, 0, {
-                                     'attribute_id': attribute.id,
-                                     'value_ids': [(6, 0, [attribute_value.id])] # Start with this value
-                                 }))
-                                 current_attributes.add(attribute.id) # Mark as handled for this product
-                             else:
-                                 # Attribute is planned, ensure this value is added
-                                 for cmd in accumulated_attr_line_cmds:
-                                      if cmd[0] == 0 and cmd[2]['attribute_id'] == attribute.id:
-                                          if attribute_value.id not in cmd[2]['value_ids'][0][2]:
-                                               cmd[2]['value_ids'][0][2].append(attribute_value.id)
-                                          break
-                        else:
-                             # Attribute exists on template, check if value needs to be added
-                             existing_line = next((line for line in current_attribute_lines if line.attribute_id.id == attribute.id), None)
-                             if existing_line and attribute_value.id not in existing_line.value_ids.ids:
-                                  # Check if already planned in accumulated commands
-                                  planned_update = False
-                                  for cmd in accumulated_attr_line_cmds:
-                                      if cmd[0] == 1 and cmd[1] == existing_line.id:
-                                          if attribute_value.id not in cmd[2]['value_ids'][0][2]:
-                                               cmd[2]['value_ids'][0][2].append(attribute_value.id)
-                                          planned_update = True
-                                          break
-                                  if not planned_update:
-                                       # If not planned, add a command to update the existing line
-                                       # Use (6, 0, ...) to replace existing values + add the new one
-                                       all_value_ids = existing_line.value_ids.ids + [attribute_value.id]
-                                       accumulated_attr_line_cmds.append((1, existing_line.id, {'value_ids': [(6, 0, all_value_ids)] }))
-
-                        # --- Accumulate Price Extra Commands ---
-                        if shopify_variant_id not in accumulated_price_extra_cmds:
-                            accumulated_price_extra_cmds[shopify_variant_id] = {}
-                        accumulated_price_extra_cmds[shopify_variant_id][attribute_value.id] = price_extra
-
-                # --- Variant Create/Update Logic (largely unchanged, uses 'existing_variant') ---
-
-                existing_variant = ProductModel.search([('default_code', '=', sku)], limit=1)
-                if not existing_variant and variant_attribute_value_ids:
-                     ptav_domain = [
-                         ('attribute_line_id', 'in', existing_template.attribute_line_ids.ids),
-                         ('product_attribute_value_id', 'in', variant_attribute_value_ids)
-                     ]
-                     ptav_ids = ProductTmplAttrValueModel.search(ptav_domain).ids
-                     if ptav_ids and len(ptav_ids) == len(variant_attribute_value_ids):
-                         variant_domain = [('product_tmpl_id', '=', existing_template.id)]
-                         for ptav_id in ptav_ids:
-                             variant_domain.append(('product_template_attribute_value_ids', '=', ptav_id))
-                         existing_variant = ProductModel.search(variant_domain, limit=1)
-
-                # Check for barcode conflicts before assigning
-                final_barcode_value = None # Default to no barcode
-                if barcode: # Only check if we have a barcode from Shopify
-                    ProductModel = self.env['product.product'] # Ensure ProductModel is defined here
-                    domain = [('barcode', '=', barcode)]
-                    if existing_variant:
-                        # Exclude the current variant if it already exists
-                        domain.append(('id', '!=', existing_variant.id))
-
-                    conflicting_product = ProductModel.search(domain, limit=1)
-
-                    if conflicting_product:
-                        _logger.warning(f"Barcode '{barcode}' from Shopify for SKU '{sku}' already exists on product '{conflicting_product.display_name}' (ID: {conflicting_product.id}). Skipping barcode assignment for this variant.")
-                        # final_barcode_value remains None
+                    # Check if this attribute line already exists on the template
+                    existing_line = existing_template.attribute_line_ids.filtered(lambda line: line.attribute_id.id == attribute.id)
+                    if not existing_line:
+                         # Add command to create a new attribute line
+                         new_attribute_line_cmds.append((0, 0, {'attribute_id': attribute.id, 'value_ids': [(6, 0, value_ids)]}))
+                         _logger.info(f"Prepared command to add new attribute line '{attr_name}' with values: {value_set}")
                     else:
-                        # No conflict found, or the barcode belongs to the current variant
-                        final_barcode_value = barcode
+                         # Add command to update existing line's values (add missing ones)
+                         # Get IDs already on the line
+                         current_value_ids = set(existing_line.value_ids.ids)
+                         # Find IDs from the batch that are not yet on the line
+                         new_value_ids_to_add = [vid for vid in value_ids if vid not in current_value_ids]
+                         if new_value_ids_to_add:
+                              # Command to add values to existing line: (1, line_id, {'value_ids': [(4, value_id_to_add)]})
+                              # Using (6, 0, ...) might be safer to replace all values if needed, but let's try adding first.
+                              # Let's use (6, 0, ...) to ensure all required values are present.
+                              all_required_values = list(current_value_ids.union(value_ids))
+                              new_attribute_line_cmds.append((1, existing_line.id, {'value_ids': [(6, 0, all_required_values)]}))
+                              _logger.info(f"Prepared command to update attribute line '{attr_name}' to ensure values: {value_set}")
 
-                variant_data = {
-                    'product_tmpl_id': existing_template.id,
-                    'default_code': sku,
-                    'barcode': final_barcode_value, # Use the checked value
-                    'standard_price': actual_cost, # Use cost fetched from InventoryItem
-                    'weight': _convert_weight_to_kg(variant_weight_value, variant_weight_unit), # Use conversion helper
-                    'active': True,
-                }
 
-                variant_image_url = shopify_images.get(variant_image_id)
-                variant_image_b64 = None
-                if variant_image_url:
-                    _logger.info(f"Attempting to fetch image URL: {variant_image_url} for variant SKU {sku}")
+                # Apply attribute line changes if any new commands were generated
+                if new_attribute_line_cmds:
                     try:
-                        image_response = requests.get(variant_image_url, timeout=10)
-                        if image_response.status_code == 200:
-                            variant_image_b64 = base64.b64encode(image_response.content).decode('utf-8')
-                            variant_data['image_1920'] = variant_image_b64
-                            _logger.info(f"Successfully fetched image for variant SKU {sku}")
-                        else:
-                            _logger.warning(f"Failed to fetch image for variant SKU {sku}: Status code {image_response.status_code}")
-                    except Exception as e:
-                        _logger.warning(f"Failed to fetch image for variant SKU {sku}: {str(e)}")
-                else:
-                    _logger.info(f"No specific image ID found for variant SKU {sku}. It will inherit template image.")
-
-                # --- Logging: Check data before write/create ---
-                log_variant_data = variant_data.copy() # Avoid logging full image data
-                image_info = f"Yes (length: {len(variant_image_b64)})" if variant_image_b64 else "No"
-                log_variant_data.pop('image_1920', None) # Remove image data for cleaner log
-                _logger.info(f"Variant Data for SKU {sku} (before write/create): {log_variant_data}") # LOGGING MODIFIED
-                _logger.info(f"  -> Includes image_1920: {image_info}") # LOGGING MODIFIED
-
-                if existing_variant:
-                    _logger.debug(f"Writing variant data for existing variant {existing_variant.id} (SKU: {sku})") # LOGGING ADDED
-                    # --- ADDED sudo() ---
-                    existing_variant.sudo().write(variant_data)
-                    # --- END sudo() ---
-                    _logger.info(f"Updated variant: SKU {sku} for template {existing_template.name}")
-                    processed_variant_ids_for_product.add(existing_variant.id)
-                else:
-                    # Search again
-                    ptav_domain = [
-                         ('attribute_line_id', 'in', existing_template.attribute_line_ids.ids),
-                         ('product_attribute_value_id', 'in', variant_attribute_value_ids)
-                     ]
-                    ptav_ids = ProductTmplAttrValueModel.search(ptav_domain).ids
-                    if ptav_ids and len(ptav_ids) == len(variant_attribute_value_ids):
-                         variant_domain = [('product_tmpl_id', '=', existing_template.id)]
-                         for ptav_id in ptav_ids:
-                             variant_domain.append(('product_template_attribute_value_ids', '=', ptav_id))
-                         existing_variant = ProductModel.search(variant_domain, limit=1)
-
-                    if existing_variant:
-                         _logger.debug(f"Writing variant data for existing variant {existing_variant.id} (found after template update, SKU: {sku})") # LOGGING ADDED
-                         # --- ADDED sudo() ---
-                         existing_variant.sudo().write(variant_data)
-                         # --- END sudo() ---
-                         _logger.info(f"Updated variant (found after template update): SKU {sku}")
-                         processed_variant_ids_for_product.add(existing_variant.id)
-                    else:
-                         _logger.error(f"Could not find or create variant for SKU {sku} and template {existing_template.name}. Manual check needed.")
-                         skipped_variants += 1
-                         continue
-
-                # --- Set Price Extra on Attribute Values ---
-                price_extra_cmds_for_variant = variant_price_extra_cmds.get(shopify_variant_id, {})
-                _logger.info(f"Attempting to set price_extra for variant SKU {sku}: {price_extra_cmds_for_variant}")
-                for value_id, price_extra_val in price_extra_cmds_for_variant.items():
-                    ptav_search_domain = [
-                        ('product_tmpl_id', '=', existing_template.id),
-                        ('product_attribute_value_id', '=', value_id)
-                    ]
-                    ptav_recs = ProductTmplAttrValueModel.search(ptav_search_domain)
-                    _logger.debug(f"  Searching for PTAV with domain: {ptav_search_domain}") # LOGGING ADDED
-                    if ptav_recs:
-                        _logger.info(f"  Found {len(ptav_recs)} PTAV records (IDs: {ptav_recs.ids}) for value ID {value_id}. Writing price_extra: {price_extra_val}")
-                        try:
-                            ptav_recs.write({'price_extra': price_extra_val})
-                            _logger.info(f"  Successfully set price_extra {price_extra_val} for value ID {value_id} on template {existing_template.name}")
-                        except Exception as e_price:
-                            _logger.error(f"  Error writing price_extra for value ID {value_id}: {e_price}")
-                    else:
-                        _logger.warning(f"  Could not find PTAV record for value ID {value_id} on template {existing_template.name} to set price_extra.")
+                        _logger.info(f"Applying attribute line commands to template {existing_template.name}: {new_attribute_line_cmds}")
+                        existing_template.write({'attribute_line_ids': new_attribute_line_cmds})
+                        _logger.info(f"Successfully updated attribute lines for template {existing_template.name}.")
+                        # Refresh the template record to get updated attribute lines/values
+                        existing_template.invalidate_cache(['attribute_line_ids'])
+                        existing_template.refresh()
+                    except Exception as attr_e:
+                        _logger.error(f"Failed to write attribute lines for template {existing_template.name}: {attr_e}")
+                        # Continue processing variants, but log the error
+                        skipped_variants += len(variant_batch) # Consider skipping inventory/variant updates if attributes failed?
+                        continue # Skip to next batch
 
 
-                # --- Handle Inventory (Multi-Location) ---
-                if location_mapping: # Only proceed if we have a location map
-                    inventory_item_id = variant.get("inventory_item_id")
-                    if inventory_item_id:
-                        # Get pre-fetched levels for this variant's item ID
-                        current_variant_levels = inventory_levels_by_item_id.get(str(inventory_item_id), [])
+                # --- Process Variants within the Batch ---
+                for variant in variant_batch:
+                    shopify_variant_id = str(variant["id"])
+                    sku = variant.get("sku") or f"odoo-{shopify_product_id}-{shopify_variant_id}" # Fallback SKU
+                    inventory_item_id_str = str(variant.get("inventory_item_id"))
 
-                        if current_variant_levels:
-                            _logger.info(f"Processing {len(current_variant_levels)} pre-fetched inventory levels for SKU {sku} (Item ID: {inventory_item_id})")
-                            updated_odoo_location_ids = set() # Keep track of locations updated for this variant
+                    # Find corresponding Odoo variant
+                    # Search by Shopify Variant ID first, then by SKU
+                    existing_variant = ProductModel.search([('shopify_variant_id', '=', shopify_variant_id)], limit=1)
+                    if not existing_variant:
+                         # Search by SKU only if not found by shopify_variant_id
+                         # Ensure we search within the correct template
+                         existing_variant = ProductModel.search([
+                             ('default_code', '=', sku),
+                             ('product_tmpl_id', '=', existing_template.id)
+                         ], limit=1)
+                         if not existing_variant and sku.startswith('odoo-'):
+                              # Try searching by Odoo ID if using fallback SKU and not found by default_code
+                              try:
+                                   odoo_variant_id = int(sku.split('-')[-1])
+                                   existing_variant = ProductModel.search([
+                                       ('id', '=', odoo_variant_id),
+                                       ('product_tmpl_id', '=', existing_template.id)
+                                   ], limit=1)
+                              except (ValueError, IndexError):
+                                   pass # Invalid fallback SKU format
 
-                            for level in current_variant_levels: # Use pre-fetched levels
-                                shopify_loc_id_str = str(level.get('location_id'))
-                                available_qty_raw = level.get('available')
-                                try:
-                                    # Odoo quantities are floats
-                                    available_qty = float(available_qty_raw) if available_qty_raw is not None else 0.0
-                                except (ValueError, TypeError):
-                                    _logger.warning(f"    Could not convert Shopify available quantity '{available_qty_raw}' to float for Loc ID {shopify_loc_id_str}. Defaulting to 0.0.")
-                                    available_qty = 0.0
+                    # --- Prepare Variant Data ---
+                    variant_price = float(variant.get("price", 0.0))
+                    variant_compare_at_price = float(variant.get("compare_at_price", 0.0) or 0.0) # Handle null
+                    variant_weight = _convert_weight_to_kg(float(variant.get("grams", 0.0) or 0.0), 'g') # Shopify uses grams
+                    variant_cost = costs_by_item_id.get(inventory_item_id_str, 0.0) # Get pre-fetched cost
 
-                                # --- DEBUG LOGGING ---
-                                _logger.info(f"  Processing Inv Level - Shopify Loc ID: {shopify_loc_id_str}, Available Qty: {available_qty}")
-                                # --- END DEBUG LOGGING ---
+                    variant_data = {
+                        'default_code': sku,
+                        'barcode': variant.get("barcode"),
+                        'shopify_variant_id': shopify_variant_id,
+                        'shopify_inventory_item_id': inventory_item_id_str,
+                        'standard_price': variant_cost, # Map Shopify cost to Odoo cost
+                        'weight': variant_weight,
+                        'active': True, # Assume variants from Shopify are active
+                        'product_tmpl_id': existing_template.id, # Ensure linked to template
+                        # Price is handled via pricelist or template attribute value price extra
+                    }
 
-                                odoo_location_id = location_mapping.get(shopify_loc_id_str)
-
-                                if odoo_location_id:
-                                    # --- DEBUG LOGGING ---
-                                    _logger.info(f"    Mapped to Odoo Loc ID: {odoo_location_id}")
-                                    # --- END DEBUG LOGGING ---
-                                    updated_odoo_location_ids.add(odoo_location_id)
-                                    try:
-                                        _logger.info(f"  Attempting to set inventory for SKU {sku} (Product ID {existing_variant.id}) at Odoo Loc ID {odoo_location_id} to {available_qty} using _update_available_quantity")
-                                        # Use _update_available_quantity, ensuring we pass recordsets
-                                        location_record = self.env['stock.location'].browse(odoo_location_id)
-                                        if not location_record.exists():
-                                            _logger.error(f"    Could not find stock.location record for ID {odoo_location_id}. Skipping inventory update.")
-                                            continue # Skip this level if location record not found
-
-                                        # Ensure product_id is also a recordset (should be already, but safer)
-                                        product_record = self.env['product.product'].browse(existing_variant.id)
-                                        if not product_record.exists():
-                                             _logger.error(f"    Could not find product.product record for ID {existing_variant.id}. Skipping inventory update.")
-                                             continue
-
-                                        # available_qty is now guaranteed to be a float (default 0.0)
-                                        _logger.info(f"    Attempting to set inventory for product={product_record.id}, location={location_record.id}, qty={available_qty}")
-
-                                        # Find or create the specific stock.quant record
-                                        # We use sudo() here as inventory adjustments often require higher privileges
-                                        quant = InventoryModel.sudo().search([
-                                            ('product_id', '=', product_record.id),
-                                            ('location_id', '=', location_record.id),
-                                            # Add lot_id, package_id, owner_id checks here if they become relevant
-                                        ], limit=1)
-
-                                        if quant:
-                                            # If quant exists, update inventory_quantity if different and apply
-                                            if quant.inventory_quantity != available_qty:
-                                                quant.inventory_quantity = available_qty
-                                                quant.action_apply_inventory()
-                                                _logger.info(f"    Applied inventory update (set to {available_qty}) for existing quant ID {quant.id}")
-                                            else:
-                                                _logger.info(f"    Skipped inventory update for quant ID {quant.id} - quantity already {available_qty}")
-                                        else:
-                                            # If quant doesn't exist, create it and apply inventory
-                                            # Odoo typically removes zero quants, but creating then applying should handle it.
-                                            quant = InventoryModel.sudo().create({
-                                                'product_id': product_record.id,
-                                                'location_id': location_record.id,
-                                                'inventory_quantity': available_qty,
-                                                # Add lot_id, package_id, owner_id here if relevant
-                                            })
-                                            quant.action_apply_inventory()
-                                            _logger.info(f"    Created new quant ID {quant.id} and applied inventory (set to {available_qty})")
-                                    except Exception as e_inv:
-                                        _logger.exception(f"  Error applying inventory adjustment for SKU {sku} at Odoo Loc ID {odoo_location_id}: {e_inv}")
+                    # --- Determine Attribute Values for this Variant ---
+                    variant_attribute_values = []
+                    # Use option_values if available
+                    if variant.get("option_values"):
+                         for option in variant.get("option_values", []):
+                              attr_name = option.get('option_name') # Get name from option_values
+                              val_name = option.get('value')
+                              if attr_name and val_name:
+                                   # Find the corresponding product.template.attribute.value
+                                   # Search within the template's attribute lines for efficiency
+                                   ptav_domain = [
+                                       ('product_tmpl_id', '=', existing_template.id),
+                                       ('attribute_id.name', '=', attr_name),
+                                       ('product_attribute_value_id.name', '=', val_name)
+                                   ]
+                                   ptav = ProductTmplAttrValueModel.search(ptav_domain, limit=1)
+                                   if ptav:
+                                       variant_attribute_values.append(ptav.id)
+                                   else:
+                                        _logger.warning(f"Could not find Odoo ProductTmplAttrValue for Variant {sku}, Attr: '{attr_name}', Value: '{val_name}'. Domain: {ptav_domain}")
+                    else: # Fallback to option1, option2, option3
+                        for option_num in range(1, 4):
+                            option_key = f"option{option_num}"
+                            val_name = variant.get(option_key)
+                            if val_name:
+                                # Find the corresponding attribute name from product options
+                                attr_name = (product.get("options", []) + [{}, {}, {}])[option_num - 1].get("name")
+                                if attr_name:
+                                    # Find the corresponding product.template.attribute.value
+                                    ptav_domain = [
+                                        ('product_tmpl_id', '=', existing_template.id),
+                                        ('attribute_id.name', '=', attr_name),
+                                        ('product_attribute_value_id.name', '=', val_name)
+                                    ]
+                                    ptav = ProductTmplAttrValueModel.search(ptav_domain, limit=1)
+                                    if ptav:
+                                        variant_attribute_values.append(ptav.id)
+                                    else:
+                                         _logger.warning(f"Could not find Odoo ProductTmplAttrValue for Variant {sku}, Attr: '{attr_name}', Value: '{val_name}' (using fallback {option_key}). Domain: {ptav_domain}")
                                 else:
-                                    _logger.warning(f"  Could not find mapped Odoo location for Shopify Location ID {shopify_loc_id_str}. Skipping inventory update for this location.")
+                                     _logger.warning(f"Could not determine attribute name for {option_key}='{val_name}' on variant {sku}.")
 
-                        else:
-                             _logger.warning(f"Could not fetch inventory levels for SKU {sku} (Item ID: {inventory_item_id}). Inventory sync skipped for this variant.")
+
+                    if not variant_attribute_values and len(existing_template.attribute_line_ids) > 0:
+                         _logger.warning(f"Variant {sku} has no attribute values identified, but template has attributes. Skipping attribute linking.")
+                    elif variant_attribute_values:
+                         variant_data['product_template_attribute_value_ids'] = [(6, 0, variant_attribute_values)]
+
+
+                    # --- Create or Update Odoo Variant ---
+                    if not existing_variant:
+                        try:
+                            # Ensure attribute values are set correctly before creating
+                            if 'product_template_attribute_value_ids' not in variant_data and len(existing_template.attribute_line_ids) > 0:
+                                 _logger.error(f"Attempting to create variant {sku} for template with attributes, but no attribute values were resolved. Skipping creation.")
+                                 skipped_variants += 1
+                                 continue # Skip this variant
+
+                            existing_variant = ProductModel.create(variant_data)
+                            _logger.info(f"  Created new product variant: SKU {sku} (Odoo ID: {existing_variant.id}, Shopify Variant ID: {shopify_variant_id})")
+                        except Exception as create_e:
+                            _logger.error(f"  Failed to create product variant for SKU {sku}: {create_e}. Data: {variant_data}")
+                            skipped_variants += 1
+                            continue # Skip inventory update if creation failed
                     else:
-                        _logger.warning(f"Shopify variant data for SKU {sku} is missing 'inventory_item_id'. Inventory sync skipped.")
-                else:
-                     _logger.warning("Location mapping not available. Inventory sync skipped for variant SKU {sku}.")
+                        try:
+                            # Ensure we don't unset attributes if they weren't resolved correctly
+                            if 'product_template_attribute_value_ids' not in variant_data and len(existing_variant.product_template_attribute_value_ids) > 0:
+                                 _logger.warning(f"Resolved attribute values for existing variant {sku} are empty, but variant already has values. Removing attribute data from update dict to prevent unlinking.")
+                                 variant_data.pop('product_template_attribute_value_ids', None)
 
-                 # --- End of Inner Variant Batch Loop (for variant in variant_batch) ---
-             # --- End of Outer Variant Batch Loop (for i in range...) ---
- 
-             # --- Apply Accumulated Attribute Lines (after all batches for the product) ---
-            if accumulated_attr_line_cmds:
-                  _logger.info(f"Applying {len(accumulated_attr_line_cmds)} accumulated attribute line commands for template: {existing_template.name}")
-                  try:
-                      # Use sudo() if permissions require it
-                      existing_template.sudo().write({'attribute_line_ids': accumulated_attr_line_cmds})
-                      # Refresh template to get updated attribute lines for price extra setting
-                      existing_template.invalidate_cache(['attribute_line_ids'])
-                      existing_template.refresh()
-                      _logger.info(f"Successfully applied attribute lines for template {existing_template.name}")
-                  except Exception as e_attr:
-                       _logger.error(f"Error applying accumulated attribute lines for template {existing_template.name}: {e_attr}")
- 
-             # --- Apply Accumulated Price Extra (after attributes are set) ---
-            _logger.info(f"Applying accumulated price extra commands for {len(accumulated_price_extra_cmds)} variants of product {existing_template.name}")
-            for shopify_variant_id, price_extra_cmds_for_variant in accumulated_price_extra_cmds.items():
-                  _logger.debug(f"  Processing price extra for Shopify Variant ID: {shopify_variant_id}")
-                  for value_id, price_extra_val in price_extra_cmds_for_variant.items():
-                      # Find the PTAV record *now* after attributes are potentially updated
-                      ptav_search_domain = [
-                          ('product_tmpl_id', '=', existing_template.id),
-                          ('product_attribute_value_id', '=', value_id)
-                      ]
-                      # Use sudo() if needed
-                      ptav_recs = ProductTmplAttrValueModel.sudo().search(ptav_search_domain)
-                      _logger.debug(f"    Searching for PTAV with domain: {ptav_search_domain} to set price_extra={price_extra_val}")
-                      if ptav_recs:
-                          _logger.info(f"    Found {len(ptav_recs)} PTAV records (IDs: {ptav_recs.ids}) for value ID {value_id}. Writing price_extra: {price_extra_val}")
-                          try:
-                              # Use sudo() if needed
-                              ptav_recs.sudo().write({'price_extra': price_extra_val})
-                          except Exception as e_price:
-                              _logger.error(f"    Error writing price_extra for value ID {value_id}: {e_price}")
-                      else:
-                          _logger.warning(f"    Could not find PTAV record for value ID {value_id} on template {existing_template.name} to set price_extra after batch processing.")
- 
-             # --- Optional: Deactivate Odoo variants not present in this sync for this product ---
-             # This requires fetching all existing Odoo variants for the template first
-             # existing_odoo_variants = ProductModel.sudo().search([('product_tmpl_id', '=', existing_template.id)])
-             # variants_to_deactivate = existing_odoo_variants.filtered(lambda v: v.id not in processed_variant_ids_for_product)
-             # if variants_to_deactivate:
-             #    _logger.info(f"Deactivating {len(variants_to_deactivate)} Odoo variants for template {existing_template.name} not found in Shopify sync.")
-             #    variants_to_deactivate.sudo().write({'active': False})
- 
-             # Track the latest update time processed successfully
-            product_update_time = product.get('updated_at')
-            if product_update_time:
-                  try:
-                      current_time_dt = parser.isoparse(product_update_time)
-                      if latest_update_time_processed is None or current_time_dt > latest_update_time_processed:
-                           latest_update_time_processed = current_time_dt
-                  except ValueError:
-                       _logger.warning(f"Could not parse 'updated_at' timestamp '{product_update_time}' for product {shopify_product_id}")
- 
-             # Commit after each product is fully processed (including all its variant batches)
-             # Consider potential performance impact of committing frequently vs. risk of losing work on error
-            try:
-                self.env.cr.commit()
-                _logger.info(f"Committed transaction after processing product {shopify_product_id}")
-            except Exception as commit_e:
-                  _logger.error(f"Error committing transaction after product {shopify_product_id}: {commit_e}. Rolling back.")
-                  self.env.cr.rollback()
-                  # Decide if you want to stop the whole sync or continue with the next product
-                  # break # Example: Stop sync on commit error
- 
-             # --- End of 'for product in shopify_products:' loop ---
+                            existing_variant.write(variant_data)
+                            _logger.info(f"  Updated product variant: SKU {sku} (Odoo ID: {existing_variant.id}, Shopify Variant ID: {shopify_variant_id})")
+                        except Exception as update_e:
+                            _logger.error(f"  Failed to update product variant SKU {sku} (Odoo ID: {existing_variant.id}): {update_e}. Data: {variant_data}")
+                            skipped_variants += 1
+                            continue # Skip inventory update if update failed
 
-        # Update last_sync_time based on the last processed product's timestamp
-        # Update last_sync_time based on the latest 'updated_at' timestamp encountered across ALL processed products
-        # This requires tracking the maximum timestamp during the loop.
-        # Let's refine this logic. We should ideally store the timestamp of the *last successfully processed* product
-        # from the *current run* to ensure we don't miss updates if an error occurs mid-sync.
-        # For now, we'll update it based on the last product processed in the loop if successful.
-        # A more robust approach might involve storing progress per product.
+                    # --- Update Price Extra on Template Attribute Value ---
+                    # Calculate price difference from template's base price
+                    price_extra = variant_price - base_price
+                    # Apply price extra to the specific combination of attribute values for this variant
+                    if variant_attribute_values:
+                         # Find the specific ptav records matching this variant's combination
+                         # This assumes variant_attribute_values contains the correct IDs of ProductTmplAttrValueModel records
+                         ptav_records = ProductTmplAttrValueModel.browse(variant_attribute_values)
+                         for ptav in ptav_records:
+                              # Store command to apply later, avoiding multiple writes
+                              # We only store the *last* price extra found for a given value combination in this batch
+                              # This might need refinement if multiple variants share *some* but not all values.
+                              # A safer approach might be to store price extra directly on product.product if Odoo version supports it well,
+                              # or handle it via pricelist rules based on attributes.
+                              # For now, let's update the ptav price_extra.
+                              if ptav.id not in variant_price_extra_cmds or variant_price_extra_cmds[ptav.id] != price_extra:
+                                   variant_price_extra_cmds[ptav.id] = price_extra # Store intended price_extra
 
-        latest_update_time_in_batch = None
-        if shopify_products:
-            # Find the latest 'updated_at' from the fetched products (assuming they are sorted ascending)
-            # Filter out products without 'updated_at' just in case
-            valid_update_times = [p.get('updated_at') for p in shopify_products if p.get('updated_at')]
-            if valid_update_times:
-                latest_update_time_in_batch = max(valid_update_times)
+                    # --- Update Inventory ---
+                    if location_mapping and inventory_item_id_str in inventory_levels_by_item_id:
+                        inventory_levels = inventory_levels_by_item_id[inventory_item_id_str]
+                        _logger.info(f"  Processing {len(inventory_levels)} inventory level records for Inv Item ID {inventory_item_id_str} (SKU: {sku})")
 
-        # Only update last_sync_time if the sync seemed successful and we have a new time
-        # We might need a more robust success check later
-        if latest_update_time_in_batch:
-             # Add a small buffer (e.g., 1 second) to avoid potential clock skew issues if needed,
-             # but using the exact time of the last processed item is usually fine.
-             # new_last_sync_time = (parser.isoparse(latest_update_time_in_batch) + timedelta(seconds=1)).isoformat()
-             new_last_sync_time = latest_update_time_in_batch
-             ConfigParam.set_param('shopify.last_sync_time', new_last_sync_time)
-             _logger.info(f"Set last sync time (shopify.last_sync_time) to: {new_last_sync_time}")
-        elif shopify_products:
-             _logger.warning("Processed products but could not determine the latest 'updated_at' timestamp. Last sync time not updated.")
-        elif shopify_products:
-             _logger.warning("Processed products but could not determine the 'updated_at' of the last one. Last sync time not updated.")
+                        for level in inventory_levels:
+                            shopify_location_id = str(level.get("location_id"))
+                            available_qty = int(level.get("available", 0)) # Shopify 'available'
+
+                            odoo_location_id = location_mapping.get(shopify_location_id)
+
+                            if odoo_location_id:
+                                try:
+                                    # Use Odoo's method to update inventory (handles quant creation/update)
+                                    # This sets the *on-hand* quantity. 'available' might differ in Odoo due to reservations.
+                                    # We are setting Odoo's on-hand based on Shopify's available.
+                                    _logger.info(f"  Attempting to set inventory for SKU {sku} (Product ID {existing_variant.id}) at Odoo Loc ID {odoo_location_id} to {available_qty} using _update_available_quantity")
+                                    InventoryModel.with_context(inventory_mode=True).sudo()._update_available_quantity(
+                                        existing_variant,
+                                        LocationModel.browse(odoo_location_id),
+                                        available_qty
+                                    )
+                                    _logger.info(f"    Successfully updated/set inventory for SKU {sku} at Odoo Loc {odoo_location_id} to {available_qty}.")
+
+                                except Exception as inv_e:
+                                    _logger.error(f"    Failed to update inventory for SKU {sku} at Odoo Loc {odoo_location_id}: {inv_e}")
+                                    # Attempt manual quant creation/update as fallback (less robust)
+                                    try:
+                                        _logger.warning(f"    Falling back to manual quant adjustment for SKU {sku} at Odoo Loc {odoo_location_id}.")
+                                        quant = InventoryModel.sudo().search([
+                                            ('product_id', '=', existing_variant.id),
+                                            ('location_id', '=', odoo_location_id),
+                                        ], limit=1)
+                                        if quant:
+                                            if quant.quantity != available_qty:
+                                                 quant.sudo().write({'quantity': available_qty})
+                                                 _logger.info(f"      Manually updated existing quant for SKU {sku} at Loc {odoo_location_id} to {available_qty}.")
+                                            # else: pass # Quantity already correct
+                                        else:
+                                            quant = InventoryModel.sudo().create({
+                                                'product_id': existing_variant.id,
+                                                'location_id': odoo_location_id,
+                                                'quantity': available_qty,
+                                                'inventory_quantity': available_qty, # Set initial inventory quantity
+                                            })
+                                            _logger.info(f"      Manually created new quant for SKU {sku} at Loc {odoo_location_id} with qty {available_qty}.")
+                                    except Exception as manual_inv_e:
+                                         _logger.error(f"      Manual quant adjustment also failed for SKU {sku} at Odoo Loc {odoo_location_id}: {manual_inv_e}")
+
+                            else:
+                                _logger.warning(f"  No Odoo location mapping found for Shopify Location ID: {shopify_location_id}. Cannot update inventory for SKU {sku} at this location.")
+                    elif not location_mapping:
+                         _logger.debug(f"  Skipping inventory update for SKU {sku} because location mapping is missing.")
+                    elif inventory_item_id_str not in inventory_levels_by_item_id:
+                         _logger.debug(f"  Skipping inventory update for SKU {sku} because no inventory levels were fetched for Item ID {inventory_item_id_str}.")
+
+
+                    # Track latest processed update time
+                    variant_updated_at = parser.parse(variant["updated_at"])
+                    if latest_update_time_processed is None or variant_updated_at > latest_update_time_processed:
+                        latest_update_time_processed = variant_updated_at
+
+            # --- Apply Price Extra Updates After Batch ---
+            if variant_price_extra_cmds:
+                 _logger.info(f"Applying {len(variant_price_extra_cmds)} price extra updates for template {existing_template.name}...")
+                 for ptav_id, price_extra in variant_price_extra_cmds.items():
+                      try:
+                           ptav_record = ProductTmplAttrValueModel.browse(ptav_id)
+                           if ptav_record.exists() and ptav_record.price_extra != price_extra:
+                                ptav_record.sudo().write({'price_extra': price_extra})
+                                _logger.debug(f"  Set price_extra={price_extra} for PTAV ID {ptav_id} ({ptav_record.display_name})")
+                      except Exception as pe_e:
+                           _logger.error(f"  Failed to write price_extra for PTAV ID {ptav_id}: {pe_e}")
+
+
+            # --- Final check for product update time ---
+            product_updated_at = parser.parse(product["updated_at"])
+            if latest_update_time_processed is None or product_updated_at > latest_update_time_processed:
+                latest_update_time_processed = product_updated_at
+
+
+        # --- Update Last Sync Time ---
+        if latest_update_time_processed:
+            # Add a small buffer to avoid precision issues? Maybe not necessary.
+            new_sync_time_str = latest_update_time_processed.strftime('%Y-%m-%d %H:%M:%S')
+            ConfigParam.set_param('shopify.last_sync_time', new_sync_time_str)
+            _logger.info(f"Shopify sync completed. Updated last sync time to: {new_sync_time_str}")
         else:
-             _logger.info("No products processed in this batch. Last sync time not updated.")
+            # If no products were processed, update time to now to prevent re-fetching same batch
+            fallback_sync_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            ConfigParam.set_param('shopify.last_sync_time', fallback_sync_time)
+            _logger.info(f"Shopify sync completed. No new product updates found. Setting last sync time to current time: {fallback_sync_time}")
 
 
-        _logger.info(f"Batch sync completed: {created_templates} created templates, {updated_templates} updated templates, {skipped_variants} skipped variants.")
-        return {
-            "status": "success",
-            "created": created_templates,
-            "updated": updated_templates,
-            "skipped": skipped_variants
-        }
+        _logger.info(f"Sync finished. Created: {created_templates}, Updated: {updated_templates}, Skipped Variants: {skipped_variants}")
+        return True # Indicate success
 
 
-# Add to product.template
+# --- Model Extensions ---
+
 class ProductTemplate(models.Model):
     _inherit = "product.template"
-    shopify_product_id = fields.Char("Shopify Product ID", index=True, copy=False)
 
+    shopify_product_id = fields.Char("Shopify Product ID", index=True, copy=False)
+    # Add other Shopify-specific fields if needed
 
 class ProductProduct(models.Model):
     _inherit = "product.product"
 
-    shopify_variant_id = fields.Char("Shopify Variant ID", index=True) # Add if needed
+    shopify_variant_id = fields.Char("Shopify Variant ID", index=True, copy=False)
+    shopify_inventory_item_id = fields.Char("Shopify Inventory Item ID", index=True, copy=False)
+    # Inherit shopify_product_id from template for easier searching?
     shopify_product_id = fields.Char(
-        "Shopify Product ID",
         related='product_tmpl_id.shopify_product_id',
-        store=True,
-        index=True,
-        help="Technical field to link variant to Shopify Product ID on template"
+        string="Shopify Product ID (Template)",
+        store=False, # No need to store if related
+        readonly=True
     )
 
-
-# Add shopify_location_id to stock.location for mapping
 class StockLocation(models.Model):
     _inherit = "stock.location"
 
-    shopify_location_id = fields.Char("Shopify Location ID", index=True, copy=False, readonly=True,
-                                     help="Technical field to link Odoo Stock Locations to Shopify Locations.")
+    # No shopify_location_id needed here if mapping is done via warehouse
+    # shopify_location_id = fields.Char("Shopify Location ID", index=True, copy=False)
 
-
-# Add shopify_location_id to stock.warehouse for mapping
 class StockWarehouse(models.Model):
     _inherit = "stock.warehouse"
 
-    shopify_location_id = fields.Char("Shopify Location ID", index=True, copy=False, readonly=True,
-                                     help="Technical field to link Odoo Warehouses to Shopify Locations.")
+    shopify_location_id = fields.Char("Shopify Location ID", index=True, copy=False, help="The ID of the corresponding Location in Shopify")
