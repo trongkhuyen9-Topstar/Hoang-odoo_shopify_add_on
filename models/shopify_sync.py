@@ -693,25 +693,57 @@ class ShopifySync(models.Model):
                     if not variant_attribute_values and len(existing_template.attribute_line_ids) > 0:
                          _logger.warning(f"Variant {sku} has no attribute values identified, but template has attributes. Skipping attribute linking.")
                     elif variant_attribute_values:
+                         # Use the format (6, 0, [IDs]) for linking Many2many
                          variant_data['product_template_attribute_value_ids'] = [(6, 0, variant_attribute_values)]
 
 
                     # --- Create or Update Odoo Variant ---
                     if not existing_variant:
-                        try:
-                            # Ensure attribute values are set correctly before creating
-                            if 'product_template_attribute_value_ids' not in variant_data and len(existing_template.attribute_line_ids) > 0:
-                                 _logger.error(f"Attempting to create variant {sku} for template with attributes, but no attribute values were resolved. Skipping creation.")
-                                 skipped_variants += 1
-                                 continue # Skip this variant
-
-                            existing_variant = ProductModel.create(variant_data)
-                            _logger.info(f"  Created new product variant: SKU {sku} (Odoo ID: {existing_variant.id}, Shopify Variant ID: {shopify_variant_id})")
-                        except Exception as create_e:
-                            _logger.error(f"  Failed to create product variant for SKU {sku}: {create_e}. Data: {variant_data}")
-                            skipped_variants += 1
-                            continue # Skip inventory update if creation failed
+                        # Check for existing combination with the same attributes
+                        combination_domain = [
+                            ('product_tmpl_id', '=', existing_template.id),
+                            ('product_template_attribute_value_ids', '=', variant_attribute_values)
+                        ]
+                        
+                        # Search for variants with the exact same attribute combination
+                        combination_variant = ProductModel.search(combination_domain, limit=1)
+                        
+                        if combination_variant:
+                            _logger.warning(f"Variant with combination already exists (ID: {combination_variant.id}). Updating Shopify IDs instead of creating new variant.")
+                            
+                            # Update the existing variant with Shopify IDs if missing
+                            update_vals = {
+                                'shopify_variant_id': shopify_variant_id,
+                                'shopify_inventory_item_id': inventory_item_id_str,
+                                'default_code': sku,  # Update SKU if different
+                                'barcode': variant.get("barcode"),  # Update barcode if different
+                            }
+                            
+                            # Only update fields that have values and are different
+                            update_vals = {k: v for k, v in update_vals.items() if v and (
+                                not getattr(combination_variant, k) or 
+                                getattr(combination_variant, k) != v
+                            )}
+                            
+                            if update_vals:
+                                try:
+                                    combination_variant.write(update_vals)
+                                    _logger.info(f"Updated existing variant ID {combination_variant.id} with Shopify data")
+                                except Exception as update_e:
+                                    _logger.error(f"Failed to update existing variant: {update_e}")
+                            
+                            existing_variant = combination_variant
+                        else:
+                            # Create new variant only if combination doesn't exist
+                            try:
+                                existing_variant = ProductModel.create(variant_data)
+                                _logger.info(f"Created new variant: {sku} (ID: {existing_variant.id})")
+                            except Exception as create_e:
+                                _logger.error(f"Failed to create variant {sku}: {create_e}")
+                                skipped_variants += 1
+                                continue
                     else:
+                        # --- Update Existing Variant (Found by ID or SKU initially) ---
                         try:
                             # Ensure we don't unset attributes if they weren't resolved correctly
                             if 'product_template_attribute_value_ids' not in variant_data and len(existing_variant.product_template_attribute_value_ids) > 0:
