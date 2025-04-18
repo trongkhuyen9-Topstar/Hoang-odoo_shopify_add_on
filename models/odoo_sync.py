@@ -376,7 +376,6 @@ class OdooSync(models.Model):
 
             _logger.info(f"Processing variant {variant.id} (SKU: {variant.default_code})")
             _logger.info(f"Inventory Item ID: {variant.shopify_inventory_item_id}")
-            _logger.info(f"Stock in Odoo Location {odoo_loc_id}: {qty} units")
 
             if not variant.shopify_inventory_item_id or not variant.shopify_inventory_item_id.isdigit():
                 error_msg = f"Missing inventory item ID for variant {variant.default_code}"
@@ -390,6 +389,8 @@ class OdooSync(models.Model):
                     qty = self._get_product_stock_for_location(variant, odoo_loc_id)
                     if qty < 0:
                         qty = 0
+
+                    _logger.info(f"Stock in Odoo Location {odoo_loc_id}: {qty} units")  
 
                     payload = {
                         "location_id": int(shopify_loc_id),
