@@ -592,14 +592,11 @@ class ShopifySync(models.Model):
                         _logger.info(f"Applying attribute line commands to template {existing_template.name}: {new_attribute_line_cmds}")
                         existing_template.write({'attribute_line_ids': new_attribute_line_cmds})
                         _logger.info(f"Successfully updated attribute lines for template {existing_template.name}.")
-                        # Refresh the template record to get updated attribute lines/values
-                        existing_template.invalidate_cache(['attribute_line_ids'])
-                        existing_template.refresh()
                     except Exception as attr_e:
                         _logger.error(f"Failed to write attribute lines for template {existing_template.name}: {attr_e}")
                         # Continue processing variants, but log the error
-                        skipped_variants += len(variant_batch) # Consider skipping inventory/variant updates if attributes failed?
-                        continue # Skip to next batch
+                        skipped_variants += len(variant_batch)
+                        continue
 
 
                 # --- Process Variants within the Batch ---
@@ -645,6 +642,7 @@ class ShopifySync(models.Model):
                         'active': True, # Assume variants from Shopify are active
                         'product_tmpl_id': existing_template.id, # Ensure linked to template
                         # Price is handled via pricelist or template attribute value price extra
+                        'tracking': 'lot' if variant.get('inventory_management') else 'none',
                     }
 
                     # --- Determine Attribute Values for this Variant ---
@@ -702,7 +700,7 @@ class ShopifySync(models.Model):
                         # Check for existing combination with the same attributes
                         combination_domain = [
                             ('product_tmpl_id', '=', existing_template.id),
-                            ('product_template_attribute_value_ids', '=', variant_attribute_values)
+                            ('product_template_attribute_value_ids', 'in', variant_attribute_values)
                         ]
                         
                         # Search for variants with the exact same attribute combination
@@ -775,7 +773,7 @@ class ShopifySync(models.Model):
                               if ptav.id not in variant_price_extra_cmds or variant_price_extra_cmds[ptav.id] != price_extra:
                                    variant_price_extra_cmds[ptav.id] = price_extra # Store intended price_extra
 
-                    # --- Update Inventory ---
+                    # --- Update Inventory (Fixed to prevent doubling) ---
                     if location_mapping and inventory_item_id_str in inventory_levels_by_item_id:
                         inventory_levels = inventory_levels_by_item_id[inventory_item_id_str]
                         _logger.info(f"  Processing {len(inventory_levels)} inventory level records for Inv Item ID {inventory_item_id_str} (SKU: {sku})")
@@ -788,16 +786,35 @@ class ShopifySync(models.Model):
 
                             if odoo_location_id:
                                 try:
-                                    # Use Odoo's method to update inventory (handles quant creation/update)
-                                    # This sets the *on-hand* quantity. 'available' might differ in Odoo due to reservations.
-                                    # We are setting Odoo's on-hand based on Shopify's available.
-                                    _logger.info(f"  Attempting to set inventory for SKU {sku} (Product ID {existing_variant.id}) at Odoo Loc ID {odoo_location_id} to {available_qty} using _update_available_quantity")
-                                    InventoryModel.with_context(inventory_mode=True).sudo()._update_available_quantity(
-                                        existing_variant,
-                                        LocationModel.browse(odoo_location_id),
-                                        available_qty
-                                    )
-                                    _logger.info(f"    Successfully updated/set inventory for SKU {sku} at Odoo Loc {odoo_location_id} to {available_qty}.")
+                                    # Get current quantity in Odoo
+                                    current_quant = InventoryModel.sudo().search([
+                                        ('product_id', '=', existing_variant.id),
+                                        ('location_id', '=', odoo_location_id),
+                                    ], limit=1)
+                                    
+                                    if current_quant:
+                                        current_qty = current_quant.quantity
+                                        # Calculate difference needed
+                                        difference = available_qty - current_qty
+                                        
+                                        if difference != 0:
+                                            _logger.info(f"  Current quantity: {current_qty}, Shopify quantity: {available_qty}, Applying difference: {difference}")
+                                            InventoryModel.with_context(inventory_mode=True).sudo()._update_available_quantity(
+                                                existing_variant,
+                                                LocationModel.browse(odoo_location_id),
+                                                difference  # Apply just the difference
+                                            )
+                                            _logger.info(f"    Successfully adjusted inventory for SKU {sku} at Odoo Loc {odoo_location_id} by {difference} (new qty: {available_qty}).")
+                                        else:
+                                            _logger.debug(f"    No inventory adjustment needed for SKU {sku} at Odoo Loc {odoo_location_id} (qty matches Shopify).")
+                                    else:
+                                        # No existing quant, create new one with exact quantity
+                                        _logger.info(f"    No existing quant found for SKU {sku} at Odoo Loc {odoo_location_id}, creating with qty {available_qty}")
+                                        InventoryModel.with_context(inventory_mode=True).sudo()._update_available_quantity(
+                                            existing_variant,
+                                            LocationModel.browse(odoo_location_id),
+                                            available_qty
+                                        )
 
                                 except Exception as inv_e:
                                     _logger.error(f"    Failed to update inventory for SKU {sku} at Odoo Loc {odoo_location_id}: {inv_e}")
@@ -809,16 +826,16 @@ class ShopifySync(models.Model):
                                             ('location_id', '=', odoo_location_id),
                                         ], limit=1)
                                         if quant:
-                                            if quant.quantity != available_qty:
-                                                 quant.sudo().write({'quantity': available_qty})
-                                                 _logger.info(f"      Manually updated existing quant for SKU {sku} at Loc {odoo_location_id} to {available_qty}.")
-                                            # else: pass # Quantity already correct
+                                            current_qty = quant.quantity
+                                            difference = available_qty - current_qty
+                                            if difference != 0:
+                                                quant.sudo().write({'quantity': available_qty})
+                                                _logger.info(f"      Manually updated existing quant for SKU {sku} at Loc {odoo_location_id} to {available_qty}.")
                                         else:
                                             quant = InventoryModel.sudo().create({
                                                 'product_id': existing_variant.id,
                                                 'location_id': odoo_location_id,
                                                 'quantity': available_qty,
-                                                'inventory_quantity': available_qty, # Set initial inventory quantity
                                             })
                                             _logger.info(f"      Manually created new quant for SKU {sku} at Loc {odoo_location_id} with qty {available_qty}.")
                                     except Exception as manual_inv_e:

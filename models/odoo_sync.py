@@ -139,8 +139,8 @@ class OdooSync(models.Model):
             if not raw_mapping:
                 return {}
                 
-            # Verify Shopify locations exist
-            valid_shopify_locs = self._verify_shopify_locations(
+            # Verify Shopify locations exist or create them if they don't
+            valid_shopify_locs = self._verify_or_create_shopify_locations(
                 list(raw_mapping.keys()),
                 headers,
                 base_url
@@ -158,18 +158,99 @@ class OdooSync(models.Model):
             _logger.error(f"Failed to get location mapping: {str(e)}")
             return {}
 
-    def _verify_shopify_locations(self, location_ids, headers, base_url):
-        """Verify Shopify locations exist"""
+    def _verify_or_create_shopify_locations(self, location_ids, headers, base_url):
+        """Verify Shopify locations exist or create them if they don't"""
         valid_locations = []
+        existing_locations = self._get_existing_shopify_locations(headers, base_url)
+        
         for loc_id in location_ids:
             try:
-                url = f"{base_url}/admin/api/2023-01/locations/{loc_id}.json"
-                response = requests.get(url, headers=headers, timeout=10)
-                if response.status_code == 200:
+                # Check if location exists in Shopify
+                if str(loc_id) in existing_locations:
                     valid_locations.append(str(loc_id))
+                    continue
+                
+                # If not, try to create it by getting Odoo location details
+                odoo_location = self._get_odoo_location_for_shopify_id(loc_id)
+                if not odoo_location:
+                    _logger.warning(f"No Odoo location found for Shopify ID {loc_id}")
+                    continue
+                
+                # Create the location in Shopify
+                created_id = self._create_shopify_location(odoo_location, headers, base_url)
+                if created_id:
+                    valid_locations.append(str(created_id))
+                    # Update the location mapping with the new ID
+                    self._update_location_mapping(loc_id, created_id)
+                    
             except Exception as e:
-                _logger.error(f"Error verifying location {loc_id}: {str(e)}")
+                _logger.error(f"Error processing location {loc_id}: {str(e)}")
+                
         return valid_locations
+
+    def _get_existing_shopify_locations(self, headers, base_url):
+        """Get all existing Shopify locations"""
+        try:
+            url = f"{base_url}/admin/api/2023-01/locations.json"
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                locations = response.json().get('locations', [])
+                return {str(loc['id']) for loc in locations}
+            return set()
+        except Exception as e:
+            _logger.error(f"Error getting existing locations: {str(e)}")
+            return set()
+
+    def _get_odoo_location_for_shopify_id(self, shopify_loc_id):
+        """Get Odoo location corresponding to Shopify location ID"""
+        mapping = self.env['shopify.sync'].sudo()._get_odoo_shopify_location_mapping()
+        odoo_loc_id = mapping.get(shopify_loc_id)
+        if odoo_loc_id:
+            return self.env['stock.location'].browse(odoo_loc_id)
+        return None
+
+    def _create_shopify_location(self, odoo_location, headers, base_url):
+        """Create a new location in Shopify"""
+        try:
+            payload = {
+                "location": {
+                    "name": odoo_location.complete_name,
+                    "address1": odoo_location.partner_id.street or "N/A",
+                    "city": odoo_location.partner_id.city or "N/A",
+                    "province": odoo_location.partner_id.state_id.name or "N/A",
+                    "country": odoo_location.partner_id.country_id.code or "US",
+                    "zip": odoo_location.partner_id.zip or "00000",
+                    "phone": odoo_location.partner_id.phone or "",
+                    "legacy": False,
+                    "active": True
+                }
+            }
+            
+            url = f"{base_url}/admin/api/2023-01/locations.json"
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+            
+            if response.status_code == 201:
+                location_id = response.json().get('location', {}).get('id')
+                _logger.info(f"Created new Shopify location with ID {location_id}")
+                return location_id
+                
+            _logger.error(f"Failed to create location: {response.status_code} - {response.text}")
+            return None
+            
+        except Exception as e:
+            _logger.error(f"Error creating Shopify location: {str(e)}")
+            return None
+
+    def _update_location_mapping(self, old_id, new_id):
+        """Update the location mapping with new Shopify location ID"""
+        try:
+            sync_model = self.env['shopify.sync'].sudo()
+            mapping = sync_model._get_odoo_shopify_location_mapping()
+            if str(old_id) in mapping:
+                odoo_loc_id = mapping[str(old_id)]
+                sync_model._update_location_mapping_entry(old_id, new_id, odoo_loc_id)
+        except Exception as e:
+            _logger.error(f"Error updating location mapping: {str(e)}")
 
     def _sync_single_template(self, template, headers, base_url, location_mapping, results):
         """Sync a single product template to Shopify"""
