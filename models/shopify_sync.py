@@ -450,6 +450,8 @@ class ShopifySync(models.Model):
                 'type': 'product',
                 'shopify_product_id': shopify_product_id,
                 'list_price': base_price,
+                'company_id': self.env.company.id,
+                'vendor': product.get('vendor'),
             }
 
             main_image_url = (product.get("image", {}) or {}).get("src")
@@ -482,6 +484,24 @@ class ShopifySync(models.Model):
             #             taxes.append(tax.id)
             #     if taxes:
             #         template_data['taxes_id'] = [(6, 0, taxes)]
+
+            vendor_name = template_data.pop('vendor', False)
+            if vendor_name:
+                # Search for existing vendor
+                vendor = self.env['res.partner'].search([
+                    ('name', '=', vendor_name),
+                    ('supplier_rank', '>', 0),
+                    ('company_id', '=', self.env.company.id)
+                ], limit=1)
+                if not vendor:
+                    # Create new vendor
+                    vendor = self.env['res.partner'].create({
+                        'name': vendor_name,
+                        'supplier_rank': 1,
+                        'company_id': self.env.company.id,
+                    })
+                    _logger.info(f"Created new vendor: {vendor_name}")
+                template_data['seller_ids'] = [(4, vendor.id)]
 
             if existing_template:
                 # Prevent changing the type of an existing product that might have transactions
